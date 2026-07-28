@@ -13,7 +13,7 @@ services:
     container_name: dugs-runner
     restart: unless-stopped
     ports:
-      - "5800:5800"
+      - "5801:5801"
     volumes:
       # your exported workflows — the only thing that needs to change
       - ./projects:/data/projects
