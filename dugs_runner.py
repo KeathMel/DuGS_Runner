@@ -32,7 +32,7 @@ ENVIRONMENT
 ===========
     DUGS_DATA_DIR   where projects/ lives              (default: next to this file)
     DUGS_HOST       http bind address                  (default: 0.0.0.0)
-    DUGS_PORT       http port                          (default: 5800)
+    DUGS_PORT       http port                          (default: 5801)
 """
 import os
 import sys
@@ -52,6 +52,7 @@ APP_DIR = os.environ.get("DUGS_APP_DIR", HERE)
 DATA_DIR = os.environ.get("DUGS_DATA_DIR", HERE)
 PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
 HOST = os.environ.get("DUGS_HOST", "0.0.0.0")
+# default 5801 so it never clashes with the desktop app's API on 5800
 PORT = int(os.environ.get("DUGS_PORT", "5801"))
 
 # the app folder has to be importable so engine.py and the nodes resolve
@@ -381,6 +382,11 @@ def main():
     print("=" * 52)
     log(f"app dir  : {APP_DIR}")
     log(f"data dir : {DATA_DIR}")
+
+    # always have a projects/ folder so there's somewhere to drop workflows,
+    # even on a fresh clone that's never deployed anything yet
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+    log(f"projects : {PROJECTS_DIR}")
 
     engine = load_engine()
     Handler.engine = engine
