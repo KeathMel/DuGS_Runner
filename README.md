@@ -28,7 +28,7 @@ Nothing to configure twice. The workflow already says how it should fire.
 Everything it needs ships with it. Python 3.9 or higher, nothing to pip install.
 
 ```
-git clone https://github.com/KeathMel/DuGS_Runner.git
+git clone https://github.com/KeathMel/Deploy_DuGS
 cd DuGS_Runner
 python3 dugs_runner.py
 ```
