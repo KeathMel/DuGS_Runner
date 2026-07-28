@@ -5,9 +5,7 @@ You build workflows in the DuGS app on your own machine, then drop them here and
 this keeps them running — on a Pi, a server, a phone, whatever you leave on.
 
 If you want to BUILD workflows you want the app instead:
-https://github.com/KeathMel/DuGS
-
----
+https://github.com/KeathMel/DuGS_LINUX
 
 ## WHAT IT DOES
 
@@ -28,7 +26,8 @@ Nothing to configure twice. The workflow already says how it should fire.
 Everything it needs ships with it. Python 3.9 or higher, nothing to pip install.
 
 ```
-git clone https://github.com/KeathMel/Deploy_DuGS
+git clone https://github.com/KeathMel/DuGS_Runner
+
 cd DuGS_Runner
 python3 dugs_runner.py
 ```
