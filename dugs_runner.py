@@ -26,7 +26,7 @@ USAGE
     python3 dugs_runner.py                     # everything, defaults
     python3 dugs_runner.py --run my_workflow   # run one workflow now and exit
     python3 dugs_runner.py --list              # show what's loaded and its trigger
-    python3 dugs_runner.py --port 5800 --host 0.0.0.0
+    python3 dugs_runner.py --port 5801 --host 0.0.0.0
 
 ENVIRONMENT
 ===========
@@ -52,7 +52,7 @@ APP_DIR = os.environ.get("DUGS_APP_DIR", HERE)
 DATA_DIR = os.environ.get("DUGS_DATA_DIR", HERE)
 PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
 HOST = os.environ.get("DUGS_HOST", "0.0.0.0")
-PORT = int(os.environ.get("DUGS_PORT", "5800"))
+PORT = int(os.environ.get("DUGS_PORT", "5801"))
 
 # the app folder has to be importable so engine.py and the nodes resolve
 sys.path.insert(0, APP_DIR)
