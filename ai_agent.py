@@ -36,12 +36,7 @@ markdown-fence stripping as a fallback).
 import json
 import urllib.request
 import urllib.error
-import os
-import sys
 from node_base import Node, resolve_expr
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import ai_helper
 
 # Official DeepSeek OpenAI-compatible endpoint.
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -71,14 +66,6 @@ class AINode(Node):
         {"key": "output_shape", "label": "Output JSON example (optional)", "type": "multiline",
          "default": ""},
         {"key": "max_tokens", "label": "Max tokens", "type": "number", "default": 1024},
-
-        # ---- token limit ----
-        {"key": "no_limit", "label": "No token limit", "type": "bool", "default": False,
-         "desc": "Switch off the run cap and let the AI run without a token limit."},
-        {"key": "token_limit", "label": "Run token limit", "type": "number", "default": 8000,
-         "desc": "Once the whole run has used more than this many AI tokens, "
-                 "further AI calls are skipped. Ignored when 'No token limit' is on.",
-         "show_if": {"no_limit": False}},
     ]
 
     def _resolve_key(self):
@@ -111,12 +98,6 @@ class AINode(Node):
         except (TypeError, ValueError):
             max_tokens = 1024
 
-        no_limit = bool(self.params.get("no_limit", False))
-        try:
-            token_limit = int(self.params.get("token_limit", 8000) or 0)
-        except (TypeError, ValueError):
-            token_limit = 0
-
         if not api_key:
             return [{"json": {"error": "AI node: no DeepSeek token set"}}]
 
@@ -130,15 +111,6 @@ class AINode(Node):
         out = []
         for item in items:
             j = item.get("json", {})
-
-            # run-level token cap: once the whole run has spent too much, stop
-            # calling the AI instead of running up the bill
-            if not no_limit and token_limit > 0 and \
-                    ai_helper.tokens_used() >= token_limit:
-                out.append({"json": {**j,
-                    "error": f"AI node: run token limit ({token_limit}) reached",
-                    "tokens_used": ai_helper.tokens_used()}})
-                continue
 
             # resolve {{ }} references against this item (and other nodes)
             user_msg = self.rexpr(input_tpl, j) if input_tpl else ""
@@ -193,14 +165,11 @@ class AINode(Node):
                 parsed = self._parse_json(reply_text)
                 if parsed is None:
                     out.append({"json": {**j, "error": "AI node: reply was not valid JSON",
-                                          "raw_reply": reply_text,
-                                          "tokens_used": ai_helper.tokens_used()}})
+                                          "raw_reply": reply_text}})
                 else:
-                    out.append({"json": {**j, **parsed,
-                                          "tokens_used": ai_helper.tokens_used()}})
+                    out.append({"json": {**j, **parsed}})
             else:
-                out.append({"json": {**j, "reply": reply_text,
-                                      "tokens_used": ai_helper.tokens_used()}})
+                out.append({"json": {**j, "reply": reply_text}})
 
         return out
 
@@ -219,10 +188,6 @@ class AINode(Node):
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "ignore")
             raise RuntimeError(f"HTTP {e.code}: {detail[:300]}")
-        # add this call's usage to the shared run-wide counter, so the Run Log
-        # total and the Memory node's compaction trigger both see it
-        used = (payload.get("usage") or {}).get("total_tokens", 0)
-        ai_helper._add_tokens(used)
         # OpenAI-format response: choices[0].message.content
         choices = payload.get("choices", [])
         if choices:

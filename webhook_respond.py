@@ -1,26 +1,11 @@
 """
 Respond to Webhook: sends an HTTP response back to whoever triggered the
 workflow via a Webhook Trigger node, then the workflow stops.
-
-If a workflow has a Webhook Trigger but NO Respond node, the API server
-auto-responds with {"ok": true} once the workflow finishes.
-
-If you test this from the editor's Run button (not a real HTTP hit), it just
-passes the data through — there's no real request to respond to.
-
-Params:
-  status        — HTTP status code to send back
-  body_mode     — "pass through item" (send the incoming item's json as-is)
-                  or "custom" (build a specific JSON body, expressions allowed)
-  custom_body   — JSON used when body_mode is "custom". Supports {{ $json.x }}
 """
 from node_base import Node, resolve_expr
 
 
 class WebhookRespondSignal(Exception):
-    """Raised to bubble the response payload up to whatever is running the
-    engine (api.py's webhook handler). Caught there; ignored harmlessly if
-    the workflow was run normally (e.g. from the editor's Run button)."""
     def __init__(self, status, body):
         self.status = status
         self.body = body
@@ -30,7 +15,7 @@ class WebhookRespondSignal(Exception):
 class WebhookRespond(Node):
     TYPE = "webhook.respond"
     TITLE = "Respond to Webhook"
-    CATEGORY = "trigger"
+    CATEGORY = "action"
     INPUTS = 1
     OUTPUTS = 1
     PARAMS = [
@@ -68,9 +53,6 @@ class WebhookRespond(Node):
         else:
             body = j
 
-        # If the API server flagged this as a real webhook execution, raise
-        # the signal so api.py can catch it and actually write the HTTP
-        # response. Otherwise (editor test run) just pass data through.
         if self.params.get("is_test_run"):
             raise WebhookRespondSignal(status, body)
 
@@ -78,7 +60,12 @@ class WebhookRespond(Node):
 
     def _resolve_deep(self, val, j):
         if isinstance(val, str):
-            return resolve_expr(val, j)
+            # FIXED: Use self.rexpr so cross-node references like $('Node Name') resolve!
+            # Fall back to resolve_expr with self._context if rexpr isn't available.
+            if hasattr(self, "rexpr"):
+                return self.rexpr(val, j)
+            context = getattr(self, "_context", {})
+            return resolve_expr(val, j, context=context)
         if isinstance(val, dict):
             return {k: self._resolve_deep(v, j) for k, v in val.items()}
         if isinstance(val, list):
