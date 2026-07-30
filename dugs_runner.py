@@ -118,13 +118,43 @@ def triggers_of(wf):
     return found
 
 
+# ---------------------------------------------------------------- run log
+# Every run writes its own file into runs/, named by project + timestamp — the
+# same pattern as a deployed project landing in projects/. The app's home
+# screen module just reads this folder; nothing more to wire up.
+RUNS_DIR = os.path.join(DATA_DIR, "runs")
+
+
+def _log_run(name, start_data, result, ms, error=None):
+    try:
+        os.makedirs(RUNS_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        safe_name = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+        fname = f"{safe_name}__{stamp}.json"
+        record = {
+            "workflow": name,
+            "ran_at": datetime.now().isoformat(timespec="seconds"),
+            "duration_ms": round(ms, 1),
+            "input": _safe(start_data),
+            "result": _safe(result),
+            "error": error,
+        }
+        with open(os.path.join(RUNS_DIR, fname), "w") as f:
+            json.dump(record, f, indent=2)
+    except Exception as e:
+        log(f"  [warn] could not write run log: {e}")
+
+
 # ---------------------------------------------------------------- running
 _run_lock = threading.Lock()
 
 
 def run_workflow(engine, wf, start_node=None, start_data=None):
     """Run one workflow. Serialised, so two triggers firing at once cannot
-    interleave and corrupt each other's state."""
+    interleave and corrupt each other's state. Every run is also written to
+    runs/ so the app can show a history of what happened and with what data —
+    which is exactly what you need to see if a real webhook sent the shape
+    you expected."""
     name = wf.get("name", "(unnamed)")
     with _run_lock:
         t0 = time.perf_counter()
@@ -133,9 +163,12 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
                                          start_data=start_data)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
+            _log_run(name, start_data, result, ms)
             return result
         except Exception as e:
+            ms = (time.perf_counter() - t0) * 1000
             log(f"ERROR running '{name}': {e}")
+            _log_run(name, start_data, None, ms, error=str(e))
             return {"error": str(e)}
 
 
@@ -279,35 +312,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fire(self, hit, data):
         log(f"webhook hit: {self.command} {self.path} -> '{hit['workflow']}'")
-
-        # Build the request item the SAME shape the app's api.py does, so the
-        # workflow's {{ $json.body }} / {{ $json.query }} resolve. Passing the
-        # raw body alone (as before) left `body` empty and starved the flow.
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(self.path)
-        query = {k: (v[0] if len(v) == 1 else v)
-                 for k, v in parse_qs(parsed.query).items()}
-        request_data = {
-            "method": self.command,
-            "path": parsed.path,
-            "query": query,
-            "headers": {k: v for k, v in self.headers.items()},
-            "body": data,
-        }
-
-        # A Respond to Webhook node only sends its HTTP reply when its
-        # 'is_test_run' flag is on — the app flips this before a real webhook
-        # run, so we do the same here. Work on a deep copy so we don't mutate
-        # the stored workflow.
-        wf = json.loads(json.dumps(hit["wf"]))
-        for n in wf.get("nodes", []):
-            if n.get("type") == "webhook.respond":
-                n.setdefault("params", {})["is_test_run"] = True
-
-        result = run_workflow(self.engine, wf, start_node=hit["node"],
-                              start_data=request_data)
-
-        # the Respond node raises a signal the engine turns into this key
+        result = run_workflow(self.engine, hit["wf"], start_node=hit["node"],
+                              start_data=data)
+        # a Respond to Webhook node decides the reply when there is one
         resp = result.get("__webhook_response__") if isinstance(result, dict) else None
         if resp:
             return self._send(resp.get("status", 200), resp.get("body", {}))
