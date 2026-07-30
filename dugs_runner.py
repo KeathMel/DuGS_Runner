@@ -224,8 +224,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
+        # CORS: a website's browser JS calling this webhook (fetch/XHR) gets
+        # silently blocked without this, even though the request itself
+        # succeeds — curl never hits this because CORS is a browser-only
+        # rule, which is exactly why terminal always worked and a website
+        # never did. Wide open ("*") since this is a webhook endpoint meant
+        # to be called from anywhere, not a cookie-authenticated API.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(raw)
+
+    def do_OPTIONS(self):
+        # the browser sends this "preflight" request before the real one on
+        # any cross-origin POST with a JSON body, and expects a bare 204 with
+        # the CORS headers — no body needed
+        self._send(204, b"")
 
     def _body(self):
         try:
@@ -329,7 +344,7 @@ class Handler(BaseHTTPRequestHandler):
         }
 
         # A Respond to Webhook node only sends its HTTP reply when its
-        # 'is_test_run' flag is on -- the app flips this before a real webhook
+        # 'is_test_run' flag is on — the app flips this before a real webhook
         # run, so we do the same here. Work on a deep copy so we don't mutate
         # the stored workflow.
         wf = json.loads(json.dumps(hit["wf"]))
