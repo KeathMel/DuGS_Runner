@@ -141,27 +141,21 @@ def _extract_layout(wf):
     return {"nodes": nodes, "connections": wf.get("connections", {})}
 
 
-def _node_status(result, timing=None, tokens=None):
-    """How long each node took, how many items it produced, and how many AI
-    tokens it spent — everything the canvas view colours and labels nodes
-    with. items_out still comes from the final result; timing and tokens
-    come from the engine's live events, captured as the run happens."""
+def _node_status(result):
+    """How many items each node produced, so the canvas view can colour them
+    — ran-with-output, ran-empty, or never reached."""
     status = {}
-    if isinstance(result, dict):
-        for node_name, ports in result.items():
-            if node_name == "__webhook_response__" or not isinstance(ports, list):
-                continue
-            total = sum(len(p) for p in ports if isinstance(p, list))
-            status[node_name] = {"items_out": total}
-    for node_name, ms in (timing or {}).items():
-        status.setdefault(node_name, {})["ms"] = round(ms, 1)
-    for node_name, tok in (tokens or {}).items():
-        status.setdefault(node_name, {})["tokens"] = tok
+    if not isinstance(result, dict):
+        return status
+    for node_name, ports in result.items():
+        if node_name == "__webhook_response__" or not isinstance(ports, list):
+            continue
+        total = sum(len(p) for p in ports if isinstance(p, list))
+        status[node_name] = {"items_out": total}
     return status
 
 
-def _log_run(name, start_data, result, ms, error=None, layout=None,
-            timing=None, tokens=None):
+def _log_run(name, start_data, result, ms, error=None, layout=None):
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -175,7 +169,7 @@ def _log_run(name, start_data, result, ms, error=None, layout=None,
             "result": _safe(result),
             "error": error,
             "layout": layout,
-            "node_status": _node_status(result, timing, tokens),
+            "node_status": _node_status(result) if result else {},
         }
         with open(os.path.join(RUNS_DIR, fname), "w") as f:
             json.dump(record, f, indent=2)
@@ -195,42 +189,20 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
     you expected."""
     name = wf.get("name", "(unnamed)")
     layout = _extract_layout(wf)
-
-    # the engine already emits per-node timing as it runs (node_done events
-    # carry "ms"), and a node that spent AI tokens usually stamps them onto
-    # its own output item ("tokens_used" / "tokens_this_call") -- both get
-    # picked up here as the run happens, no extra work inside the nodes.
-    node_timing, node_tokens = {}, {}
-
-    def on_event(evt):
-        if evt.get("kind") != "node_done":
-            return
-        node_timing[evt["node"]] = evt.get("ms", 0)
-        for item_json in (evt.get("sample") or []):
-            if not isinstance(item_json, dict):
-                continue
-            tok = item_json.get("tokens_used", item_json.get("tokens_this_call"))
-            if tok is not None:
-                node_tokens[evt["node"]] = tok
-
     with _run_lock:
         t0 = time.perf_counter()
         try:
             result = engine.run_workflow(wf, start_node=start_node,
-                                         start_data=start_data, on_event=on_event)
+                                         start_data=start_data)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
-            _log_run(name, start_data, result, ms, layout=layout,
-                     timing=node_timing, tokens=node_tokens)
+            _log_run(name, start_data, result, ms, layout=layout)
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             log(f"ERROR running '{name}': {e}")
-            _log_run(name, start_data, None, ms, error=str(e), layout=layout,
-                     timing=node_timing, tokens=node_tokens)
+            _log_run(name, start_data, None, ms, error=str(e), layout=layout)
             return {"error": str(e)}
-
-
 # ---------------------------------------------------------------- schedules
 def _next_fire(params, last):
     """When a schedule trigger should next fire."""
