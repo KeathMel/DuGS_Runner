@@ -141,21 +141,22 @@ def _extract_layout(wf):
     return {"nodes": nodes, "connections": wf.get("connections", {})}
 
 
-def _node_status(result):
-    """How many items each node produced, so the canvas view can colour them
-    — ran-with-output, ran-empty, or never reached."""
+def _node_status(result, timing=None):
+    """How many items each node produced and how long it took, so the canvas
+    view can colour and label them."""
     status = {}
-    if not isinstance(result, dict):
-        return status
-    for node_name, ports in result.items():
-        if node_name == "__webhook_response__" or not isinstance(ports, list):
-            continue
-        total = sum(len(p) for p in ports if isinstance(p, list))
-        status[node_name] = {"items_out": total}
+    if isinstance(result, dict):
+        for node_name, ports in result.items():
+            if node_name == "__webhook_response__" or not isinstance(ports, list):
+                continue
+            total = sum(len(p) for p in ports if isinstance(p, list))
+            status[node_name] = {"items_out": total}
+    for node_name, ms in (timing or {}).items():
+        status.setdefault(node_name, {})["ms"] = round(ms, 1)
     return status
 
 
-def _log_run(name, start_data, result, ms, error=None, layout=None):
+def _log_run(name, start_data, result, ms, error=None, layout=None, timing=None):
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -169,7 +170,7 @@ def _log_run(name, start_data, result, ms, error=None, layout=None):
             "result": _safe(result),
             "error": error,
             "layout": layout,
-            "node_status": _node_status(result) if result else {},
+            "node_status": _node_status(result, timing),
         }
         with open(os.path.join(RUNS_DIR, fname), "w") as f:
             json.dump(record, f, indent=2)
@@ -189,14 +190,23 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
     you expected."""
     name = wf.get("name", "(unnamed)")
     layout = _extract_layout(wf)
+
+    # per-node duration, captured from the engine's own live events as the
+    # run happens -- how long each node took before the run moved on
+    node_timing = {}
+
+    def on_event(evt):
+        if evt.get("kind") == "node_done":
+            node_timing[evt["node"]] = evt.get("ms", 0)
+
     with _run_lock:
         t0 = time.perf_counter()
         try:
             result = engine.run_workflow(wf, start_node=start_node,
-                                         start_data=start_data)
+                                         start_data=start_data, on_event=on_event)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
-            _log_run(name, start_data, result, ms, layout=layout)
+            _log_run(name, start_data, result, ms, layout=layout, timing=node_timing)
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
