@@ -125,7 +125,37 @@ def triggers_of(wf):
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 
 
-def _log_run(name, start_data, result, ms, error=None):
+def _extract_layout(wf):
+    """A lightweight snapshot of node positions and wiring, so a run record
+    can be redrawn as a mini canvas later without needing the original
+    project file — keeps a run fully self-contained even if the workflow
+    that produced it has since changed or been deleted."""
+    nodes = []
+    for n in wf.get("nodes", []):
+        nodes.append({
+            "name": n.get("name"),
+            "type": n.get("type"),
+            "x": n.get("_x", n.get("x", 0)) or 0,
+            "y": n.get("_y", n.get("y", 0)) or 0,
+        })
+    return {"nodes": nodes, "connections": wf.get("connections", {})}
+
+
+def _node_status(result):
+    """How many items each node produced, so the canvas view can colour them
+    — ran-with-output, ran-empty, or never reached."""
+    status = {}
+    if not isinstance(result, dict):
+        return status
+    for node_name, ports in result.items():
+        if node_name == "__webhook_response__" or not isinstance(ports, list):
+            continue
+        total = sum(len(p) for p in ports if isinstance(p, list))
+        status[node_name] = {"items_out": total}
+    return status
+
+
+def _log_run(name, start_data, result, ms, error=None, layout=None):
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -138,6 +168,8 @@ def _log_run(name, start_data, result, ms, error=None):
             "input": _safe(start_data),
             "result": _safe(result),
             "error": error,
+            "layout": layout,
+            "node_status": _node_status(result) if result else {},
         }
         with open(os.path.join(RUNS_DIR, fname), "w") as f:
             json.dump(record, f, indent=2)
@@ -156,6 +188,7 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
     which is exactly what you need to see if a real webhook sent the shape
     you expected."""
     name = wf.get("name", "(unnamed)")
+    layout = _extract_layout(wf)
     with _run_lock:
         t0 = time.perf_counter()
         try:
@@ -163,12 +196,12 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
                                          start_data=start_data)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
-            _log_run(name, start_data, result, ms)
+            _log_run(name, start_data, result, ms, layout=layout)
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             log(f"ERROR running '{name}': {e}")
-            _log_run(name, start_data, None, ms, error=str(e))
+            _log_run(name, start_data, None, ms, error=str(e), layout=layout)
             return {"error": str(e)}
 
 
