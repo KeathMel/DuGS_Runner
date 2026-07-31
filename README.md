@@ -5,7 +5,7 @@ You build workflows in the DuGS app on your own machine, then drop them here and
 this keeps them running — on a Pi, a server, a phone, whatever you leave on.
 
 If you want to BUILD workflows you want the app instead:
-https://github.com/KeathMel/DuGS_LINUX
+https://github.com/KeathMel/DuGS
 
 ## WHAT IT DOES
 
@@ -56,10 +56,10 @@ python3 dugs_runner.py --port 8080        # different port
 While it's running:
 
 ```
-curl http://localhost:5800/health         # is it alive
-curl http://localhost:5800/workflows      # what's loaded
-curl -X POST http://localhost:5800/run/my_workflow    # run one over http
-curl -X POST http://localhost:5800/deploy -d @wf.json # send a workflow in
+curl http://localhost:5801/health         # is it alive
+curl http://localhost:5801/workflows      # what's loaded
+curl -X POST http://localhost:5801/run/my_workflow    # run one over http
+curl -X POST http://localhost:5801/deploy -d @wf.json # send a workflow in
 ```
 
 Webhook workflows answer on whatever path you gave them in the app.
@@ -81,8 +81,43 @@ Without compose:
 
 ```
 docker build -t dugs-runner .
-docker run -d -p 5800:5800 -v ./projects:/data/projects --name dugs dugs-runner
+docker run -d -p 5801:5801 \
+  -v ./projects:/data/projects -v ./runs:/data/runs \
+  --name dugs dugs-runner
 ```
+
+### It does NOT survive a shutdown on its own
+
+A container dies with the machine on a real power-off/reboot, and nothing
+brings it back up automatically unless you tell it to. Two ways to fix that:
+
+- **docker/podman run** — add `--restart unless-stopped` to the run command
+- **compose** — already set in `compose.yml`, nothing extra needed
+
+Without one of those, after any reboot you have to `docker start dugs` (or
+`podman start dugs`) by hand before it's reachable again.
+
+### Changed a file? You MUST rebuild, and `--no-cache` if it's stubborn
+
+Editing `dugs_runner.py`, a node, `engine.py`, whatever — none of it takes
+effect until you rebuild the image:
+
+```
+docker build --no-cache -t dugs-runner .
+```
+
+Podman/Docker will happily reuse an old cached image with the same tag even
+after the source changed, and it fails **silently** — the container starts
+fine, looks healthy, `curl` from a terminal even works, and you'd never know
+the fix isn't actually in there. The only way to be sure is to check the file
+inside the running container:
+
+```
+docker exec dugs grep -c "the_thing_you_just_changed" /runner/dugs_runner.py
+```
+
+If that's `0`, the container's still on the old code — rebuild with
+`--no-cache` and try again.
 
 ---
 
@@ -100,14 +135,17 @@ same node types.
 
 | File | What it does |
 |---|---|
-| `dugs_runner.py` | The runner. Reads workflows, watches their triggers, fires them. |
+| `dugs_runner.py` | The runner. Reads workflows, watches their triggers, fires them, logs every run. |
 | `engine.py` | Walks the graph and runs the nodes. Same engine the app uses. |
 | `node_base.py` | The base class every node builds on, plus `{{ }}` expressions. |
 | `storage.py` | Reads and writes projects, tabels, credentials, memory banks. |
 | `tabel_store.py` | Storage for tabels. |
 | `ai_helper.py` | Shared AI token counter, used by the AI and Memory nodes. |
 | `nodes/` | Every node that can run. No robotics nodes — those generate Arduino code and don't run here. |
-| `projects/` | Your workflows. |
+| `projects/` | Your workflows. Deploying one that uses a Tabel or Memory Bank drops those in too. |
+| `tabels/` | Tabel data, only for the ones a deployed workflow actually uses. |
+| `memory_banks/` | Same idea, for Memory Banks. |
+| `runs/` | One file per run — what it was fed, what came out, whether it errored. The app's Runs panel reads this. |
 
 ---
 
