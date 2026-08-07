@@ -125,38 +125,7 @@ def triggers_of(wf):
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 
 
-def _extract_layout(wf):
-    """A lightweight snapshot of node positions and wiring, so a run record
-    can be redrawn as a mini canvas later without needing the original
-    project file — keeps a run fully self-contained even if the workflow
-    that produced it has since changed or been deleted."""
-    nodes = []
-    for n in wf.get("nodes", []):
-        nodes.append({
-            "name": n.get("name"),
-            "type": n.get("type"),
-            "x": n.get("_x", n.get("x", 0)) or 0,
-            "y": n.get("_y", n.get("y", 0)) or 0,
-        })
-    return {"nodes": nodes, "connections": wf.get("connections", {})}
-
-
-def _node_status(result, timing=None):
-    """How many items each node produced and how long it took, so the canvas
-    view can colour and label them."""
-    status = {}
-    if isinstance(result, dict):
-        for node_name, ports in result.items():
-            if node_name == "__webhook_response__" or not isinstance(ports, list):
-                continue
-            total = sum(len(p) for p in ports if isinstance(p, list))
-            status[node_name] = {"items_out": total}
-    for node_name, ms in (timing or {}).items():
-        status.setdefault(node_name, {})["ms"] = round(ms, 1)
-    return status
-
-
-def _log_run(name, start_data, result, ms, error=None, layout=None, timing=None):
+def _log_run(name, start_data, result, ms, error=None):
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -169,8 +138,6 @@ def _log_run(name, start_data, result, ms, error=None, layout=None, timing=None)
             "input": _safe(start_data),
             "result": _safe(result),
             "error": error,
-            "layout": layout,
-            "node_status": _node_status(result, timing),
         }
         with open(os.path.join(RUNS_DIR, fname), "w") as f:
             json.dump(record, f, indent=2)
@@ -189,30 +156,22 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
     which is exactly what you need to see if a real webhook sent the shape
     you expected."""
     name = wf.get("name", "(unnamed)")
-    layout = _extract_layout(wf)
-
-    # per-node duration, captured from the engine's own live events as the
-    # run happens -- how long each node took before the run moved on
-    node_timing = {}
-
-    def on_event(evt):
-        if evt.get("kind") == "node_done":
-            node_timing[evt["node"]] = evt.get("ms", 0)
-
     with _run_lock:
         t0 = time.perf_counter()
         try:
             result = engine.run_workflow(wf, start_node=start_node,
-                                         start_data=start_data, on_event=on_event)
+                                         start_data=start_data)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
-            _log_run(name, start_data, result, ms, layout=layout, timing=node_timing)
+            _log_run(name, start_data, result, ms)
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             log(f"ERROR running '{name}': {e}")
-            _log_run(name, start_data, None, ms, error=str(e), layout=layout)
+            _log_run(name, start_data, None, ms, error=str(e))
             return {"error": str(e)}
+
+
 # ---------------------------------------------------------------- schedules
 def _next_fire(params, last):
     """When a schedule trigger should next fire."""
@@ -265,23 +224,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
-        # CORS: a website's browser JS calling this webhook (fetch/XHR) gets
-        # silently blocked without this, even though the request itself
-        # succeeds — curl never hits this because CORS is a browser-only
-        # rule, which is exactly why terminal always worked and a website
-        # never did. Wide open ("*") since this is a webhook endpoint meant
-        # to be called from anywhere, not a cookie-authenticated API.
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(raw)
-
-    def do_OPTIONS(self):
-        # the browser sends this "preflight" request before the real one on
-        # any cross-origin POST with a JSON body, and expects a bare 204 with
-        # the CORS headers — no body needed
-        self._send(204, b"")
 
     def _body(self):
         try:
@@ -368,35 +312,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fire(self, hit, data):
         log(f"webhook hit: {self.command} {self.path} -> '{hit['workflow']}'")
-
-        # Build the request item the SAME shape the app's api.py does, so the
-        # workflow's {{ $json.body }} / {{ $json.query }} resolve. Passing the
-        # raw body alone left `body` empty and starved the flow.
-        from urllib.parse import urlparse, parse_qs
-        parsed = urlparse(self.path)
-        query = {k: (v[0] if len(v) == 1 else v)
-                 for k, v in parse_qs(parsed.query).items()}
-        request_data = {
-            "method": self.command,
-            "path": parsed.path,
-            "query": query,
-            "headers": {k: v for k, v in self.headers.items()},
-            "body": data,
-        }
-
-        # A Respond to Webhook node only sends its HTTP reply when its
-        # 'is_test_run' flag is on — the app flips this before a real webhook
-        # run, so we do the same here. Work on a deep copy so we don't mutate
-        # the stored workflow.
-        wf = json.loads(json.dumps(hit["wf"]))
-        for n in wf.get("nodes", []):
-            if n.get("type") == "webhook.respond":
-                n.setdefault("params", {})["is_test_run"] = True
-
-        result = run_workflow(self.engine, wf, start_node=hit["node"],
-                              start_data=request_data)
-
-        # the Respond node raises a signal the engine turns into this key
+        result = run_workflow(self.engine, hit["wf"], start_node=hit["node"],
+                              start_data=data)
+        # a Respond to Webhook node decides the reply when there is one
         resp = result.get("__webhook_response__") if isinstance(result, dict) else None
         if resp:
             return self._send(resp.get("status", 200), resp.get("body", {}))
