@@ -179,6 +179,21 @@ def memory_all(bank):
     return out
 
 
+def memory_all_sorted(bank, order="oldest", limit=None):
+    """Live entries as [(key, value, updated_at), ...], sorted by when they
+    were written. order='oldest' or 'newest'. limit=None means everything —
+    used by Memory Read to cap how much of a growing log gets fed out at
+    once (handy for capping what reaches an AI node)."""
+    d = load_memory_bank(bank)
+    entries = d.get("entries") or {}
+    live = [(k, e.get("value"), e.get("updated_at", 0))
+           for k, e in entries.items() if _bank_alive(e)]
+    live.sort(key=lambda t: t[2], reverse=(order == "newest"))
+    if limit:
+        live = live[:limit]
+    return live
+
+
 def memory_set(bank, key, value, ttl_seconds=None, append=False):
     """Write a key. ttl_seconds=None means it never expires.
 
