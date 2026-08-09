@@ -180,21 +180,41 @@ def memory_all(bank):
 
 
 def memory_set(bank, key, value, ttl_seconds=None, append=False):
-    """Write a key. ttl_seconds=None means it never expires. append=True keeps
-    the old value and adds to it (list or string) instead of overwriting."""
+    """Write a key. ttl_seconds=None means it never expires.
+
+    append=True writes a brand NEW, separate entry rather than growing
+    whatever's already under `key` — each append is its own item you can
+    read back individually (memory.read's 'all' mode gives you one item per
+    key), not a blob that keeps getting longer every time something's added
+    to it. The base key stays whatever it already was, untouched.
+
+    Returns (value, actual_key) — actual_key is `key` itself normally, or
+    the auto-generated key an append actually landed under.
+    """
     d = load_memory_bank(bank)
     entries = d.setdefault("entries", {})
     expires = (_time.time() + ttl_seconds) if ttl_seconds else None
-    if append and key in entries and _bank_alive(entries[key]):
-        old = entries[key].get("value")
-        if isinstance(old, list):
-            value = old + (value if isinstance(value, list) else [value])
-        else:
-            value = f"{old}\n{value}"
-    entries[key] = {"value": value, "expires_at": expires,
-                    "updated_at": _time.time()}
+
+    actual_key = key
+    if append:
+        # a millisecond timestamp suffix guarantees a fresh key and keeps
+        # appended entries naturally ordered by when they were written
+        actual_key = f"{key}__{int(_time.time() * 1000)}"
+        while actual_key in entries:   # astronomically rare, but be sure
+            actual_key = f"{key}__{int(_time.time() * 1000)}_{os.urandom(2).hex()}"
+
+    entries[actual_key] = {"value": value, "expires_at": expires,
+                           "updated_at": _time.time()}
     save_memory_bank(bank, d)
-    return value
+    return value, actual_key
+
+
+def memory_clear(bank):
+    """Remove every entry from a bank, keeping the bank itself. Used by
+    Memory Manage when compacting a spread-out log down to one summary."""
+    d = load_memory_bank(bank)
+    d["entries"] = {}
+    save_memory_bank(bank, d)
 
 
 # ---- deploy: copying a workflow into a runner's projects/ folder ----------
@@ -291,6 +311,27 @@ def _deploy_base():
     return os.path.dirname(p.rstrip("/\\"))
 
 
+def _same_dir(a, b):
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except Exception:
+        return False
+
+
+def _guard_not_local_projects(p):
+    """Refuse to deploy/undeploy if the runner folder points at the app's
+    OWN local projects/ -- if the two are the same folder, 'undeploy' and
+    'permanently delete my real saved project' become the exact same
+    operation. Cheap check, catches a mistyped/mis-scanned path before it
+    can destroy anything, regardless of how the path got set wrong."""
+    if _same_dir(p, PROJECTS_DIR):
+        raise RuntimeError(
+            f"The runner folder is set to your own local projects/ folder "
+            f"({p}) -- that's where YOUR saved projects live, not the "
+            f"runner's. Point Deploy at the RUNNER's projects/ folder "
+            f"instead (e.g. ~/Deploy_DuGS/projects), not this app's own.")
+
+
 def deploy_project(name):
     """Copy a saved project into the runner's folder, along with whatever
     Tabels or Memory Banks its nodes actually use -- those land in tabels/
@@ -301,6 +342,7 @@ def deploy_project(name):
         raise RuntimeError("no deploy folder set")
     if not os.path.isdir(p):
         raise RuntimeError(f"deploy folder not found: {p}")
+    _guard_not_local_projects(p)
     data = load_project(name)          # the current saved version
     dest = os.path.join(p, f"{name}.json")
     with open(dest, "w") as f:
@@ -341,6 +383,7 @@ def undeploy_project(name):
     if not p:
         mark_deployed(name, False)
         return
+    _guard_not_local_projects(p)
 
     my_tabels, my_banks = set(), set()
     dest = os.path.join(p, f"{name}.json")
