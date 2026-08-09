@@ -300,11 +300,19 @@ def _node_dependencies(nodes):
             name = params.get("tabel")
             if name:
                 tabels.add(name)
-        elif t in ("memory.read", "memory.write"):
+        elif t in ("memory.read", "memory.write", "memory.manage"):
             name = params.get("bank")
             if name:
                 banks.add(name)
     return tabels, banks
+
+
+def workflow_dependencies(nodes):
+    """Public entry point for _node_dependencies — for anything outside
+    storage.py that wants to know what Tabels/Memory Banks a workflow's
+    nodes reference (e.g. the editor's Tabels & Memory panel), without
+    reaching for the underscore-prefixed internal name."""
+    return _node_dependencies(nodes)
 
 
 def project_dependencies(name):
