@@ -112,7 +112,7 @@ class OpenRouterAINode(Node):
                 body["response_format"] = {"type": "json_object"}
 
             try:
-                reply_text = self._call(api_key, body)
+                reply_text, tokens_used = self._call(api_key, body)
             except Exception as e:
                 out.append({"json": {**j, "error": f"OpenRouter request failed: {e}"}})
                 continue
@@ -121,11 +121,11 @@ class OpenRouterAINode(Node):
                 parsed = self._parse_json(reply_text)
                 if parsed is None:
                     out.append({"json": {**j, "error": "OpenRouter node: reply was not valid JSON",
-                                          "raw_reply": reply_text}})
+                                          "raw_reply": reply_text, "tokens_used": tokens_used}})
                 else:
-                    out.append({"json": {**j, **parsed}})
+                    out.append({"json": {**j, **parsed, "tokens_used": tokens_used}})
             else:
-                out.append({"json": {**j, "reply": reply_text}})
+                out.append({"json": {**j, "reply": reply_text, "tokens_used": tokens_used}})
 
         return out
 
@@ -147,11 +147,19 @@ class OpenRouterAINode(Node):
             detail = e.read().decode("utf-8", "ignore")
             raise RuntimeError(f"HTTP {e.code}: {detail[:300]}")
 
+        # OpenRouter's response follows the same OpenAI-compatible shape
+        # everywhere else in DuGS uses -- usage.total_tokens is how many
+        # tokens this one call spent, stamped onto the item so it flows
+        # through the engine's node_done "sample" field untouched, same as
+        # any other field a node puts on its own output.
+        usage = payload.get("usage", {})
+        tokens_used = usage.get("total_tokens", 0)
+
         choices = payload.get("choices", [])
         if choices:
             msg = choices[0].get("message", {})
-            return (msg.get("content") or "").strip()
-        return ""
+            return (msg.get("content") or "").strip(), tokens_used
+        return "", tokens_used
 
     def _parse_json(self, text):
         if not text:
