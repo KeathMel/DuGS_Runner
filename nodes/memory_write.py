@@ -66,17 +66,19 @@ class MemoryWriteNode(Node):
         ttl_seconds = ttl * 60 if ttl > 0 else None
         append = bool(self.p("append", False))
 
+        # Write ONCE per workflow run
+        key = self.rexpr(self.p("key", ""), {})
+        value = self.rexpr(self.p("value", ""), {})
+        
+        stored, actual_key = storage.memory_set(
+            bank, key, value, ttl_seconds=ttl_seconds, append=append)
+
+        # Pass all items through, add memory info to first item only
         out = []
-        for it in (items or [{"json": {}}]):
-            j = it.get("json", {})
-            key = self.rexpr(self.p("key", ""), j)
-            value = self.rexpr(self.p("value", ""), j)
-
-            stored, actual_key = storage.memory_set(
-                bank, key, value, ttl_seconds=ttl_seconds, append=append)
-
-            result = dict(j)
-            result["memory_key"] = actual_key
-            result["memory_value"] = stored
-            out.append({"json": result})
+        for idx, it in enumerate(items or [{"json": {}}]):
+            j = dict(it.get("json", {}))
+            if idx == 0:  # Add to first item only
+                j["memory_key"] = actual_key
+                j["memory_value"] = stored
+            out.append({"json": j})
         return out
