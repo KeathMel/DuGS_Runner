@@ -164,6 +164,18 @@ class Engine:
         queue: list[tuple[str, int, list]] = list(seed)
         ran: set[str] = set()
 
+        # A "Respond to Webhook" node used to hard-return the instant it
+        # fired, abandoning anything still queued -- so a node wired AFTER
+        # Respond, or in a separate branch, never got to run. Now we just
+        # remember the response here and keep draining the queue normally;
+        # it gets attached to the result at the natural end of the run
+        # instead of short-circuiting immediately. Trade-off, on purpose:
+        # the HTTP reply now waits for the WHOLE run to finish, not just
+        # for Respond to fire -- if there's a slow node after Respond, the
+        # caller waits for it too. That's the direct cost of "a node after
+        # Respond actually runs."
+        pending_webhook_response = None
+
         def deliver(target, in_port, items):
             buffers.setdefault(target, {}).setdefault(in_port, []).extend(items)
             arrived.setdefault(target, set()).add(in_port)
@@ -241,17 +253,22 @@ class Engine:
             except Exception as e:
                 if WebhookRespondSignal is not None and isinstance(e, WebhookRespondSignal):
                     print(f"    [respond] status={e.status}")
-                    results[name] = [[{"json": e.body}]]
+                    # remembered, not returned -- the run keeps going so
+                    # anything wired after this node (or in another branch)
+                    # still gets to execute normally
+                    pending_webhook_response = {"status": e.status, "body": e.body}
                     ms = (time.perf_counter() - t0) * 1000
                     emit({"kind": "node_done", "node": name, "items_out": 1,
                           "ports": [1], "ms": ms, "sample": [e.body]})
-                    emit({"kind": "done"})
-                    print("\n=== done (responded) ===")
-                    return {"__webhook_response__": {"status": e.status, "body": e.body}, **results}
-                print(f"    [ERROR] {e}")
-                emit({"kind": "node_error", "node": name, "error": str(e)})
-                errored = True
-                output = [{"json": {"error": str(e), "node": name}}]
+                    # give it real output so anything wired to Respond's own
+                    # output port receives the same data a normal (non-signal)
+                    # completion would have produced
+                    output = [{"json": e.body}]
+                else:
+                    print(f"    [ERROR] {e}")
+                    emit({"kind": "node_error", "node": name, "error": str(e)})
+                    errored = True
+                    output = [{"json": {"error": str(e), "node": name}}]
 
             # normalise: single port vs multiple ports
             if output and isinstance(output[0], list):
@@ -294,6 +311,9 @@ class Engine:
 
         print("\n=== done ===")
         emit({"kind": "done"})
+        if pending_webhook_response is not None:
+            print("=== (webhook already responded during this run) ===")
+            return {"__webhook_response__": pending_webhook_response, **results}
         return results
 
 
