@@ -312,8 +312,36 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fire(self, hit, data):
         log(f"webhook hit: {self.command} {self.path} -> '{hit['workflow']}'")
-        result = run_workflow(self.engine, hit["wf"], start_node=hit["node"],
-                              start_data=data)
+
+        # Build the request item the SAME shape the app's api.py does, so the
+        # workflow's {{ $json.body }} / {{ $json.query }} actually resolve.
+        # Passing the raw body alone leaves `body` empty and starves the flow.
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(self.path)
+        query = {k: (v[0] if len(v) == 1 else v)
+                 for k, v in parse_qs(parsed.query).items()}
+        request_data = {
+            "method": self.command,
+            "path": parsed.path,
+            "query": query,
+            "headers": {k: v for k, v in self.headers.items()},
+            "body": data,
+        }
+
+        # A Respond to Webhook node only raises its signal (and therefore only
+        # sends a real HTTP reply) when its 'is_test_run' flag is on. The app
+        # flips this before every real webhook run -- without it the node just
+        # returns normally, no signal is raised, no __webhook_response__ ever
+        # appears, and the caller always gets the generic {"ok": true} instead
+        # of the actual response. Work on a deep copy so the stored workflow
+        # on disk is never mutated.
+        wf = json.loads(json.dumps(hit["wf"]))
+        for n in wf.get("nodes", []):
+            if n.get("type") == "webhook.respond":
+                n.setdefault("params", {})["is_test_run"] = True
+
+        result = run_workflow(self.engine, wf, start_node=hit["node"],
+                              start_data=request_data)
         # a Respond to Webhook node decides the reply when there is one
         resp = result.get("__webhook_response__") if isinstance(result, dict) else None
         if resp:
