@@ -97,7 +97,13 @@ class Engine:
                 except Exception:
                     pass
 
-        nodes_spec = workflow.get("nodes", [])
+        # Sticky notes live in the same nodes list so a workflow stays one
+        # file, but they are annotations: no ports, no code, nothing to run.
+        # They are dropped here rather than needing a node class, and BEFORE
+        # start-node detection — a note has no inputs, so it would otherwise
+        # be picked up as a trigger and "executed".
+        nodes_spec = [n for n in workflow.get("nodes", [])
+                      if n.get("type") != "note.sticky"]
         connections = workflow.get("connections", {})
 
         # build instances
