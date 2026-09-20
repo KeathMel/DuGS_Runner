@@ -227,6 +227,30 @@ class Engine:
             max_port = max(need | {0})
             input_ports = [nbuf.get(i, []) for i in range(max_port + 1)]
 
+            # ---- dead-branch skip ------------------------------------------
+            # An IF/Switch sends items down ONE branch; the others deliver
+            # zero items. Those nodes used to run anyway on an empty list,
+            # which is why a workflow lit up every node every time and why a
+            # node on an untaken branch could raise a config error ("needs a
+            # URL") for work it was never actually asked to do.
+            #
+            # A node is on a dead branch when it has at least one wired input
+            # and EVERY one of them delivered nothing. Nodes with no incoming
+            # connection (triggers) are untouched -- they are supposed to
+            # start from nothing.
+            #
+            # It is still marked as run and still pushes empty output
+            # downstream, on purpose: a Merge waiting on this port would
+            # otherwise wait forever. So the whole dead branch quietly
+            # collapses, one node at a time, instead of deadlocking.
+            #
+            # A node that genuinely wants to fire on nothing can opt out with
+            # RUNS_ON_EMPTY = True on its class.
+            node_has_inputs = name in expected_ports
+            total_in = sum(len(p) for p in input_ports)
+            skip_empty = (node_has_inputs and total_in == 0
+                         and not getattr(node, "RUNS_ON_EMPTY", False))
+
             # Multi-input nodes (INPUTS != 1) get the full per-port structure;
             # ordinary nodes get the flat item list on port 0, exactly as before.
             declared_inputs = getattr(node, "INPUTS", 1)
@@ -235,10 +259,12 @@ class Engine:
             else:
                 run_arg = input_ports
 
-            total_in = sum(len(p) for p in input_ports)
-            print(f"--> {node.TYPE} '{name}'  ({total_in} items in across {len(need)} port(s))")
-            emit({"kind": "node_running", "node": name,
-                  "type": node.TYPE, "items_in": total_in})
+            if skip_empty:
+                print(f"--> {node.TYPE} '{name}'  SKIPPED (branch not taken)")
+            else:
+                print(f"--> {node.TYPE} '{name}'  ({total_in} items in across {len(need)} port(s))")
+                emit({"kind": "node_running", "node": name,
+                      "type": node.TYPE, "items_in": total_in})
 
             # build the cross-node context: {node_name: [items...]} from every
             # node that has produced output so far, so expressions like
@@ -255,7 +281,15 @@ class Engine:
             t0 = time.perf_counter()
             errored = False
             try:
-                output = node.run(run_arg)
+                if skip_empty:
+                    # never call run() -- that is the whole point: a node on
+                    # an untaken branch should not do its work, and should
+                    # not be able to raise a config error for work nobody
+                    # asked for. Empty output on every port keeps the dead
+                    # branch collapsing cleanly downstream.
+                    output = [[] for _ in range(max(1, getattr(node, "OUTPUTS", 1)))]
+                else:
+                    output = node.run(run_arg)
             except Exception as e:
                 if WebhookRespondSignal is not None and isinstance(e, WebhookRespondSignal):
                     print(f"    [respond] status={e.status}")
@@ -289,7 +323,7 @@ class Engine:
             # small sample of output items for the live peek (first port, ≤3)
             first_port = ports[0] if ports else []
             sample = [it.get("json", {}) for it in first_port[:3]]
-            if not errored:
+            if not errored and not skip_empty:
                 emit({"kind": "node_done", "node": name, "items_out": total_out,
                       "ports": port_counts, "ms": ms, "sample": sample})
 

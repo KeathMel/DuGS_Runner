@@ -220,8 +220,17 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- helpers ----
     def _send(self, code, body, ctype="application/json"):
-        raw = body if isinstance(body, bytes) else json.dumps(body).encode()
+        # ensure_ascii=False so a real character goes out as itself. The
+        # default escapes anything non-ASCII to \uXXXX, so an em dash left
+        # here as the six literal characters \u2014 -- fine for a client that
+        # JSON-parses the reply, ugly for anything that just prints it.
+        raw = (body if isinstance(body, bytes)
+               else json.dumps(body, ensure_ascii=False).encode("utf-8"))
         self.send_response(code)
+        # spell out the charset: JSON is UTF-8 by spec, but saying so stops
+        # clients guessing now that the bytes really can be non-ASCII
+        if ctype == "application/json":
+            ctype = "application/json; charset=utf-8"
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
