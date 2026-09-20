@@ -589,3 +589,69 @@ def sweep_old_runs():
             continue
     return removed
 
+
+
+# ---- semantic tables -------------------------------------------------------
+# A semantic table is a list of intents. Each intent is ONE result plus a long
+# list of every way someone might phrase it. Matching is done by
+# semantic_search.py; this half is only the saving and loading.
+#
+#   {"name": "assistant",
+#    "intents": [
+#       {"result": "weather_check",
+#        "variations": ["weather today", "is it raining", ...]},
+#       ...
+#    ]}
+#
+# `result` is free-form on purpose: a plain string works, and so does a JSON
+# object if the workflow wants structured output. Stored as plain JSON files
+# in semantic_tables/, exactly like tabels and memory banks.
+SEMANTIC_DIR = os.path.join(HERE, "semantic_tables")
+
+
+def list_semantic_tables():
+    return _list(SEMANTIC_DIR)
+
+
+def load_semantic_table(n):
+    try:
+        return _load(SEMANTIC_DIR, n)
+    except Exception:
+        return {"name": n, "intents": []}
+
+
+def save_semantic_table(n, d):
+    _ensure(SEMANTIC_DIR)
+    _save(SEMANTIC_DIR, n, d)
+
+
+def new_semantic_table(n):
+    data = {"name": n, "intents": []}
+    save_semantic_table(n, data)
+    return data
+
+
+def delete_semantic_table(n):
+    try:
+        os.remove(_path(SEMANTIC_DIR, n))
+    except Exception:
+        pass
+
+
+def semantic_add_intent(table_name, result, variations):
+    """Add one intent (a result plus its phrasings) to a table."""
+    d = load_semantic_table(table_name)
+    d.setdefault("intents", []).append({
+        "result": result,
+        "variations": list(variations or []),
+    })
+    save_semantic_table(table_name, d)
+    return d
+
+
+def semantic_variation_count(table_name):
+    """Total phrasings across every intent -- what the UI shows as the
+    table's size, since that is the number that actually matters for how
+    well matching will work."""
+    d = load_semantic_table(table_name)
+    return sum(len(i.get("variations") or []) for i in d.get("intents", []))
