@@ -54,6 +54,19 @@ class IfNode(Node):
             "default": "auto",
             "options": ["auto", "string", "number", "boolean"],
         },
+        {
+            "key": "on_missing",
+            "label": "If the field is missing",
+            "type": "select",
+            "default": "false",
+            "options": ["false", "true", "error"],
+            "desc": "What to do when the field being checked isn't on the "
+                    "item at all. false = send it down the false branch "
+                    "(safest, and the default). true = send it down the true "
+                    "branch. error = stop and report it, for when a missing "
+                    "field means something upstream is genuinely broken and "
+                    "you'd rather know than have it quietly pick a branch.",
+        },
     ]
 
     def run(self, items):
@@ -68,18 +81,27 @@ class IfNode(Node):
 
             # resolve field: if it's an expression get the value, else do a dict lookup
             if "{{" in str(field_expr):
-                actual = resolve_expr(field_expr, j)
+                # self.rexpr (not the bare resolve_expr) so cross-node
+                # references like {{ $('Other Node').item.json.x }} actually
+                # resolve -- the bare call gets no context and silently
+                # returns None for every $('...') lookup, which then made
+                # "not equals" pass for a field that was never really read.
+                actual = self.rexpr(field_expr, j)
+                # an expression that resolves to nothing means the path did
+                # not exist on the item
+                missing = actual is None
             else:
                 field_name = str(field_expr).strip()
                 actual = j.get(field_name)
+                missing = field_name not in j
 
             # resolve comparison value
-            cmp_val = resolve_expr(value_expr, j) if isinstance(value_expr, str) else value_expr
+            cmp_val = self.rexpr(value_expr, j) if isinstance(value_expr, str) else value_expr
 
             # type coercion
             actual, cmp_val = self._coerce(actual, cmp_val, compare_as)
 
-            passed = self._test(actual, op, cmp_val, j, field_expr)
+            passed = self._test(actual, op, cmp_val, j, field_expr, missing)
             (true_items if passed else false_items).append(item)
 
         return [true_items, false_items]
@@ -104,8 +126,28 @@ class IfNode(Node):
                 pass
         return actual, cmp_val
 
-    def _test(self, actual, op, cmp_val, j, field_expr):
+    # Operators whose whole job is to report that something ISN'T there.
+    # Forcing these to False on a missing field would make them useless, so
+    # they are the only ones exempt from the rule below.
+    _ABSENCE_OPS = {"not exists", "is empty"}
+
+    def _test(self, actual, op, cmp_val, j, field_expr, missing=False):
         field_name = str(field_expr).strip()
+
+        # A field that isn't there doesn't slide through as None any more.
+        # What SHOULD happen is your call, because it genuinely differs per
+        # workflow: usually false is right, sometimes true, and sometimes a
+        # missing field means something upstream broke and you want to hear
+        # about it rather than have a branch silently chosen for you.
+        if missing and op not in self._ABSENCE_OPS:
+            mode = str(self.params.get("on_missing", "false")).lower()
+            if mode == "error":
+                shown = field_name or "(blank)"
+                raise ValueError(
+                    f"IF node: the field {shown} is missing on this item, "
+                    f"and this node is set to error when that happens.")
+            return mode == "true"
+
         if op == "equals":           return actual == cmp_val
         if op == "not equals":       return actual != cmp_val
         if op == "greater than":     return actual is not None and actual > cmp_val

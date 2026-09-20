@@ -95,6 +95,18 @@ class SwitchNode(Node):
             "options": ["none", "extra", "zero"],
         },
         {
+            "key": "on_missing",
+            "label": "If a rule's field is missing",
+            "type": "select",
+            "default": "false",
+            "options": ["false", "true", "error"],
+            "desc": "What a rule does when the field it checks isn't on the "
+                    "item at all. false = the rule simply doesn't match "
+                    "(safest, and the default). true = the rule matches "
+                    "anyway. error = stop and report it, for when a missing "
+                    "field means something upstream is genuinely broken.",
+        },
+        {
             "key": "output_names",
             "label": "Output names (optional JSON array)",
             "type": "json",
@@ -148,14 +160,30 @@ class SwitchNode(Node):
         compare_as = rule.get("type", "auto")
 
         if "{{" in str(field_expr):
-            actual = resolve_expr(field_expr, j)
+            # self.rexpr, not bare resolve_expr -- the bare call gets no
+            # context so every {{ $('Other Node')... }} silently resolved to
+            # None, which then made "not equals" style rules match on a
+            # field that was never actually read
+            actual = self.rexpr(field_expr, j)
             field_name = str(field_expr).strip()
+            missing = actual is None
         else:
             field_name = str(field_expr).strip()
             actual = j.get(field_name)
+            missing = field_name not in j
 
-        cmp_val = resolve_expr(value_expr, j) if isinstance(value_expr, str) else value_expr
+        cmp_val = self.rexpr(value_expr, j) if isinstance(value_expr, str) else value_expr
         actual, cmp_val = self._coerce(actual, cmp_val, compare_as)
+        # a field that isn't there doesn't slide through as None -- what
+        # happens instead is configurable, same as the IF node
+        if missing and op not in ("not exists", "is empty"):
+            mode = str(self.params.get("on_missing", "false")).lower()
+            if mode == "error":
+                shown = field_name or "(blank)"
+                raise ValueError(
+                    f"Switch node: the field {shown} is missing on this item, "
+                    f"and this node is set to error when that happens.")
+            return mode == "true"
         return self._test(actual, op, cmp_val, j, field_name)
 
     # --- main -----------------------------------------------------------
