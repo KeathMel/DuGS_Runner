@@ -139,6 +139,30 @@ class Engine:
         buffers: dict[str, dict[int, list]] = {}
         arrived: dict[str, set[int]] = {}
 
+        # ---- wait for EVERY wire, not just the first one --------------------
+        # A node used to fire the moment its port got its first delivery. Where
+        # two wires meet on one input -- "read the todo file, or skip straight
+        # past it" -- whichever arrived first won. When the skip side was the
+        # empty one and got there first, the node ran on nothing, was skipped,
+        # and the real data arriving a moment later was thrown away, so the
+        # whole rest of the chain died precisely when the branch WAS taken.
+        #
+        # Now every wire into a port is counted, per source node, and the node
+        # waits until each has delivered (an untaken branch still delivers --
+        # an empty list -- so this can't stall on normal branching).
+        wires_in: dict[str, dict[int, dict[str, int]]] = {}
+        for src, links in connections.items():
+            for link in links:
+                t, p = link["to"], link.get("in", 0)
+                per = wires_in.setdefault(t, {}).setdefault(p, {})
+                per[src] = per.get(src, 0) + 1
+        delivered: dict[str, dict[int, dict[str, int]]] = {}
+        # after a loop re-run resets a node, wires from nodes OUTSIDE the loop
+        # will never deliver again -- remembered here so it doesn't wait on them
+        stale: dict[str, set[str]] = {}
+        # nodes let through by the end-of-run safety valve (see _release_next)
+        released: set[str] = set()
+
         if start_node:
             seed: list[tuple[str, int, list]] = [
                 (start_node, 0, [{"json": start_data or {}}])
@@ -167,7 +191,7 @@ class Engine:
             WebhookRespondSignal = getattr(sys.modules.get(respond_cls.__module__), "WebhookRespondSignal", None)
 
         # delivery queue carries (target_name, in_port, items)
-        queue: list[tuple[str, int, list]] = list(seed)
+        queue: list[tuple] = [(n, p, i, None) for n, p, i in seed]
         ran: set[str] = set()
 
         # A "Respond to Webhook" node used to hard-return the instant it
@@ -182,12 +206,45 @@ class Engine:
         # Respond actually runs."
         pending_webhook_response = None
 
-        def deliver(target, in_port, items):
+        def deliver(target, in_port, items, source=None):
             buffers.setdefault(target, {}).setdefault(in_port, []).extend(items)
             arrived.setdefault(target, set()).add(in_port)
+            if source is not None:
+                d = delivered.setdefault(target, {}).setdefault(in_port, {})
+                d[source] = d.get(source, 0) + 1
 
-        while queue:
-            name, in_port, incoming = queue.pop(0)
+        def _all_wires_in(n, ports):
+            """Has every wire into these ports delivered (or can never)?"""
+            for p in ports:
+                got_ = delivered.get(n, {}).get(p, {})
+                for s_, cnt in wires_in.get(n, {}).get(p, {}).items():
+                    if got_.get(s_, 0) >= cnt:
+                        continue
+                    if s_ not in instances:          # wire from a deleted node
+                        continue
+                    if s_ in ran and s_ in stale.get(n, ()):
+                        continue
+                    return False
+            return True
+
+        def _release_next():
+            """Safety valve, only used once the queue has run dry. If a node
+            is still waiting on a wire that will now never deliver (e.g. a
+            second trigger that isn't the one this run started from), let it
+            run with what it has -- which is exactly how it behaved before
+            this waiting existed. One at a time, in the order they first got
+            input, so released nodes still run roughly in flow order."""
+            for n in list(arrived):
+                if (n in instances and n not in ran and n not in released
+                        and expected_ports.get(n, {0}).issubset(arrived[n])):
+                    released.add(n)
+                    queue.append((n, min(arrived[n]), [], None))
+                    print(f"    (released '{n}': a wire into it never delivered)")
+                    return True
+            return False
+
+        while queue or _release_next():
+            name, in_port, incoming, source = queue.pop(0)
 
             node_cls = instances[name].__class__
             # Loop nodes (ALLOW_RERUN) may execute more than once — this is what
@@ -203,21 +260,34 @@ class Engine:
                 ran.discard(name)
                 buffers.pop(name, None)
                 arrived.pop(name, None)
+                delivered.pop(name, None)
+                released.discard(name)
                 # anything downstream of the loop must also be allowed to run
                 # again on this new pass.
-                for dn in _downstream_of(name, connections):
+                group = _downstream_of(name, connections) | {name}
+                for dn in group - {name}:
                     ran.discard(dn)
                     buffers.pop(dn, None)
                     arrived.pop(dn, None)
+                    delivered.pop(dn, None)
+                    released.discard(dn)
+                    # wires into dn from OUTSIDE the loop won't fire again
+                    stale[dn] = {s_ for per in wires_in.get(dn, {}).values()
+                                 for s_ in per if s_ not in group}
 
-            deliver(name, in_port, incoming)
+            deliver(name, in_port, incoming, source)
 
             # Has every connected input port for this node arrived yet?
             need = expected_ports.get(name, {0})
             got = arrived.get(name, set())
-            if not need.issubset(got):
-                # still waiting on at least one upstream branch — defer.
-                continue
+            if name not in released:
+                if not need.issubset(got):
+                    # still waiting on at least one upstream branch — defer.
+                    continue
+                # loop nodes keep firing on first arrival: their back-wire can
+                # only deliver AFTER they run, so waiting would deadlock them
+                if not can_rerun and not _all_wires_in(name, need):
+                    continue
 
             ran.add(name)
             node = instances[name]
@@ -347,7 +417,7 @@ class Engine:
                 print(f"    -> '{target}'[in {dst_in}] ({len(items_for_target)} items)")
                 emit({"kind": "edge", "from": name, "out": out_port,
                       "to": target, "in": dst_in, "items": len(items_for_target)})
-                queue.append((target, dst_in, items_for_target))
+                queue.append((target, dst_in, items_for_target, name))
 
         print("\n=== done ===")
         emit({"kind": "done"})
