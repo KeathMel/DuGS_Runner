@@ -30,8 +30,10 @@ class SetNode(Node):
         },
         {
             "key": "assignments",
-            "label": "Fields (JSON array: [{\"name\":\"key\",\"value\":\"val\"}])",
-            "type": "json",
+            "label": "Fields",
+            "type": "kv_rows",
+            "name_hint": "field name",
+            "value_hint": "value, {{ }} allowed",
             "default": [{"name": "field", "value": "value"}],
         },
     ]

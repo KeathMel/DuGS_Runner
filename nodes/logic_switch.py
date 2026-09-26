@@ -62,18 +62,15 @@ class SwitchNode(Node):
             "options": ["rules", "expression"],
         },
         {
-            "key": "num_outputs",
-            "label": "Number of Outputs",
-            "type": "number",
-            "default": 4,
-        },
-        {
             "key": "rules",
-            "label": "Rules (JSON: [{field, operator, value, output}])",
-            "type": "json",
+            "label": "Outputs & rules",
+            "type": "switch_rules",
             "default": [
                 {"field": "", "operator": "equals", "value": "", "output": 0},
             ],
+            "desc": "One card per output port: the port's name, then the "
+                    "condition that routes an item to it. The number of "
+                    "ports follows the number of cards.",
         },
         {
             "key": "all_matching_outputs",
@@ -105,12 +102,6 @@ class SwitchNode(Node):
                     "(safest, and the default). true = the rule matches "
                     "anyway. error = stop and report it, for when a missing "
                     "field means something upstream is genuinely broken.",
-        },
-        {
-            "key": "output_names",
-            "label": "Output names (optional JSON array)",
-            "type": "json",
-            "default": [],
         },
     ]
 

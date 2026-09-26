@@ -32,7 +32,8 @@ class HttpRequestNode(Node):
             "default": "GET",
             "options": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
         },
-        {"key": "headers", "label": "Headers (JSON)", "type": "json", "default": {}},
+        {"key": "headers", "label": "Headers", "type": "kv_dict", "default": {},
+         "name_hint": "Header-Name", "value_hint": "value"},
         {"key": "body", "label": "Body (JSON)", "type": "json", "default": None},
         {"key": "timeout", "label": "Timeout (s)", "type": "number", "default": 15},
         {

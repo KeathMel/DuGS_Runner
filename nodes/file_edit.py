@@ -44,6 +44,19 @@ class FileEditNode(Node):
          "desc": "The file to edit. ~ works. Expressions allowed.",
          "example": "~/notes/log.txt"},
 
+        {"key": "format", "label": "File format", "type": "select",
+         "default": "text", "options": ["text", "json"],
+         "desc": "text = the file is plain text, everything is string work. "
+                 "json = the file holds JSON, and it stays real JSON: the "
+                 "node parses it, changes it, and writes it back formatted "
+                 "instead of pasting your object in as one long string."},
+
+        {"key": "match_key", "label": "Match on (json replace)", "type": "text",
+         "default": "id",
+         "desc": "In JSON mode with mode=replace: the key used to find which "
+                 "entry to update. An entry with the same value for this key "
+                 "is replaced; if none matches it gets added."},
+
         {"key": "mode", "label": "Mode", "type": "select", "default": "replace",
          "options": ["replace", "append", "prepend", "overwrite"],
          "desc": "replace = swap some text. append/prepend = add to the end "
@@ -74,6 +87,89 @@ class FileEditNode(Node):
          "desc": "On: a missing file is created (and its folders too). "
                  "Off: a missing file is an error."},
     ]
+
+    # ---- JSON mode ---------------------------------------------------------
+    def _json_edit(self, original, mode, j, path):
+        """Edit the file as real JSON. Returns (new_text, changes, error).
+
+        The whole point: an AI that hands you {"title": "x"} should end up as
+        an entry in the file, not as a line of text jammed onto the end. So
+        the file is parsed, changed as data, and written back formatted.
+        """
+        import json as _json
+
+        # what's already in the file
+        if original.strip():
+            try:
+                data = _json.loads(original)
+            except ValueError as e:
+                return None, 0, f"File Edit: '{os.path.basename(path)}' isn't valid JSON ({e})"
+        else:
+            data = []          # empty/new file starts as a list
+
+        if mode == "overwrite":
+            payload, err = self._json_payload(j)
+            if err:
+                return None, 0, err
+            return _json.dumps(payload, indent=2, ensure_ascii=False), 1, None
+
+        payload, err = self._json_payload(j)
+        if err:
+            return None, 0, err
+
+        if mode in ("append", "prepend"):
+            if not isinstance(data, list):
+                return None, 0, ("File Edit: append/prepend needs the file to "
+                                 "hold a JSON list, but it holds a "
+                                 f"{type(data).__name__}")
+            add = payload if isinstance(payload, list) else [payload]
+            data = (data + add) if mode == "append" else (add + data)
+            return _json.dumps(data, indent=2, ensure_ascii=False), len(add), None
+
+        if mode == "replace":
+            key = str(self.p("match_key", "id") or "id")
+            if not isinstance(data, list):
+                # a plain object: merge the new keys over the old ones
+                if isinstance(data, dict) and isinstance(payload, dict):
+                    data.update(payload)
+                    return _json.dumps(data, indent=2, ensure_ascii=False), 1, None
+                return None, 0, "File Edit: replace needs a JSON list or object"
+            if not isinstance(payload, dict):
+                return None, 0, "File Edit: replace needs the content to be a JSON object"
+            target = payload.get(key)
+            if target is None:
+                return None, 0, f"File Edit: the content has no '{key}' to match on"
+            for i, entry in enumerate(data):
+                if isinstance(entry, dict) and entry.get(key) == target:
+                    data[i] = payload
+                    return _json.dumps(data, indent=2, ensure_ascii=False), 1, None
+            # nothing matched -- add it rather than failing, which is what
+            # "save this task" means when the task is new
+            data.append(payload)
+            return _json.dumps(data, indent=2, ensure_ascii=False), 1, None
+
+        return None, 0, f"File Edit: unknown mode '{mode}'"
+
+    def _json_payload(self, j):
+        """The Content field, as real JSON data."""
+        import json as _json
+        raw = self.rexpr(self.p("content", ""), j)
+        if isinstance(raw, (dict, list)):
+            return raw, None          # already data, nothing to parse
+        text = str(raw or "").strip()
+        if not text:
+            return None, "File Edit: Content is empty"
+        # models like to wrap JSON in ```json fences
+        if text.startswith("```"):
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
+            if text.lstrip().startswith("json"):
+                text = text.lstrip()[4:]
+            text = text.strip()
+        try:
+            return _json.loads(text), None
+        except ValueError as e:
+            return None, f"File Edit: Content isn't valid JSON ({e})"
 
     def _resolve_path(self, raw, j):
         p = self.rexpr(raw, j)
@@ -114,7 +210,15 @@ class FileEditNode(Node):
                     with open(path, "r", encoding="utf-8") as f:
                         original = f.read()
 
-                if mode == "replace":
+                # ---- JSON mode: keep the file real JSON -----------------
+                if self.p("format", "text") == "json":
+                    new_text, swapped, err = self._json_edit(original, mode, j, path)
+                    if err:
+                        j["error"] = err
+                        out.append({"json": j})
+                        continue
+
+                elif mode == "replace":
                     find = self.rexpr(self.p("find", ""), j)
                     if not isinstance(find, str):
                         find = str(find)

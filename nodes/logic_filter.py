@@ -25,8 +25,8 @@ class FilterNode(Node):
     PARAMS = [
         {
             "key": "conditions",
-            "label": "Conditions (JSON: [{field, operator, value}])",
-            "type": "json",
+            "label": "Conditions",
+            "type": "filter_rules",
             "default": [
                 {"field": "", "operator": "equals", "value": ""},
             ],
