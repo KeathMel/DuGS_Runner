@@ -125,7 +125,40 @@ def triggers_of(wf):
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
 
 
-def _log_run(name, start_data, result, ms, error=None):
+def _extract_layout(wf):
+    """A snapshot of node positions and wiring, so a run can be redrawn as a
+    mini canvas later without needing the project file -- the app's Runs
+    drawer needs this, and without it you only ever get the text log."""
+    nodes = []
+    for n in wf.get("nodes", []):
+        nodes.append({
+            "name": n.get("name"),
+            "type": n.get("type"),
+            "x": n.get("_x", n.get("x", 0)) or 0,
+            "y": n.get("_y", n.get("y", 0)) or 0,
+        })
+    return {"nodes": nodes, "connections": wf.get("connections", {})}
+
+
+def _node_status(result, timing=None, tokens=None):
+    """Per-node item counts, duration and AI tokens -- what the canvas view
+    colours and labels each node with."""
+    status = {}
+    if isinstance(result, dict):
+        for node_name, ports in result.items():
+            if node_name == "__webhook_response__" or not isinstance(ports, list):
+                continue
+            total = sum(len(p) for p in ports if isinstance(p, list))
+            status[node_name] = {"items_out": total}
+    for node_name, ms in (timing or {}).items():
+        status.setdefault(node_name, {})["ms"] = round(ms, 1)
+    for node_name, tok in (tokens or {}).items():
+        status.setdefault(node_name, {})["tokens"] = tok
+    return status
+
+
+def _log_run(name, start_data, result, ms, error=None, layout=None,
+            timing=None, tokens=None):
     try:
         os.makedirs(RUNS_DIR, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -138,6 +171,8 @@ def _log_run(name, start_data, result, ms, error=None):
             "input": _safe(start_data),
             "result": _safe(result),
             "error": error,
+            "layout": layout,
+            "node_status": _node_status(result, timing, tokens),
         }
         with open(os.path.join(RUNS_DIR, fname), "w") as f:
             json.dump(record, f, indent=2)
@@ -156,19 +191,37 @@ def run_workflow(engine, wf, start_node=None, start_data=None):
     which is exactly what you need to see if a real webhook sent the shape
     you expected."""
     name = wf.get("name", "(unnamed)")
+    layout = _extract_layout(wf)
+
+    # per-node timing and AI token spend, picked up from the engine's own
+    # events as the run happens
+    node_timing, node_tokens = {}, {}
+
+    def on_event(evt):
+        if evt.get("kind") != "node_done":
+            return
+        node_timing[evt["node"]] = evt.get("ms", 0)
+        for item_json in (evt.get("sample") or []):
+            if isinstance(item_json, dict):
+                tok = item_json.get("tokens_used", item_json.get("tokens_this_call"))
+                if tok is not None:
+                    node_tokens[evt["node"]] = tok
+
     with _run_lock:
         t0 = time.perf_counter()
         try:
             result = engine.run_workflow(wf, start_node=start_node,
-                                         start_data=start_data)
+                                         start_data=start_data, on_event=on_event)
             ms = (time.perf_counter() - t0) * 1000
             log(f"ran '{name}' in {ms:.0f}ms")
-            _log_run(name, start_data, result, ms)
+            _log_run(name, start_data, result, ms, layout=layout,
+                     timing=node_timing, tokens=node_tokens)
             return result
         except Exception as e:
             ms = (time.perf_counter() - t0) * 1000
             log(f"ERROR running '{name}': {e}")
-            _log_run(name, start_data, None, ms, error=str(e))
+            _log_run(name, start_data, None, ms, error=str(e),
+                     layout=layout, timing=node_timing, tokens=node_tokens)
             return {"error": str(e)}
 
 
