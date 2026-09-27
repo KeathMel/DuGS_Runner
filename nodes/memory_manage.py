@@ -174,7 +174,20 @@ class MemoryManageNode(Node):
                     used += tok
         else:
             # Fall back to global token count
-            used = ai_helper.tokens_used()
+            # Tokens spent this run. ai_helper's shared counter only sees
+            # calls made THROUGH ai_helper, and the AI nodes don't use it --
+            # so it reads 0 and the threshold could never be reached. The
+            # real number is already sitting on the items that arrived here,
+            # stamped by whichever AI node produced them.
+            from_items = 0
+            for _it in (items or []):
+                _j = _it.get("json", {}) if isinstance(_it, dict) else {}
+                _t = _j.get("tokens_used") or _j.get("tokens_this_call") or 0
+                try:
+                    from_items += int(_t)
+                except (TypeError, ValueError):
+                    pass
+            used = max(ai_helper.tokens_used(), from_items)
         
         if used <= threshold:
             src = f"'{monitor_node}'" if monitor_node else "this run"
