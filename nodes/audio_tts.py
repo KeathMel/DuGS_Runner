@@ -16,18 +16,26 @@ writes them straight to disk, which is the whole job.
 
 WHICH SERVER
 ============
-Three request shapes cover everything people actually self-host, so pick the
+Four request shapes cover everything people actually self-host, so pick the
 one that matches and the rest of the settings stay put:
 
-  raw text    Piper's own http_server. The words go up as the entire request
-              body, WAV comes back.
-                  Endpoint  http://localhost:5000/
-                  python3 -m piper.http_server -m en_US-amy-medium
+  piper json  Piper's own http_server, which is what you get from
+              `pip install "piper-tts[http]"`. Sends {"text": ...} and the
+              WAV comes straight back. This is the default.
+                  Endpoint  http://localhost:5000/synthesize
+                  python3 -m piper.http_server -m en_US-lessac-medium
+
+              Piper also takes voice, speaker, speaker_id, length_scale
+              (speed, 1 is normal), noise_scale and noise_w_scale -- put any
+              of those in Extra fields.
 
   openai json {"model","input","voice","response_format"} -- what Speaches,
               openedai-speech, LocalAI and Kokoro expose.
                   Endpoint  http://localhost:8000/v1/audio/speech
-                  Voice     en_US-amy-medium
+                  Voice     en_US-lessac-medium
+
+  raw text    The whole request body is just the words. Some older and
+              homemade wrappers work this way.
 
   form        text=... as a form post, for the odd wrapper that wants it.
 
@@ -42,7 +50,7 @@ SETTINGS
 ========
 endpoint       : where your Piper server listens
 text           : the words to speak
-body_mode      : raw text | openai json | form
+body_mode      : piper json | openai json | raw text | form
 voice          : which voice, for the servers that take one
 model          : model name, for the servers that take one
 audio_format   : wav | mp3 | opus | flac  (your server has to support it)
@@ -70,6 +78,21 @@ _EXT = {"wav": ".wav", "mp3": ".mp3", "opus": ".opus", "ogg": ".ogg",
         "flac": ".flac", "aac": ".aac", "pcm": ".pcm"}
 
 
+def _number_if_possible(value):
+    """Piper wants length_scale as a number, but the settings grid is text."""
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return value
+
+
 def _safe_name(name):
     """A filename that can't climb out of the folder it was aimed at."""
     name = os.path.basename(str(name or "").strip())
@@ -86,11 +109,12 @@ class TextToSpeechNode(Node):
     OUTPUTS = 1
     PARAMS = [
         {"key": "endpoint", "label": "Piper endpoint", "type": "text",
-         "default": "http://localhost:5000/",
+         "default": "http://localhost:5000/synthesize",
          "desc": "Where your own Piper server listens. Piper's own "
-                 "http_server is port 5000; the OpenAI-compatible wrappers "
-                 "are usually http://localhost:8000/v1/audio/speech.",
-         "example": "http://localhost:5000/"},
+                 "http_server answers on port 5000 at /synthesize; the "
+                 "OpenAI-compatible wrappers are usually "
+                 "http://localhost:8000/v1/audio/speech.",
+         "example": "http://localhost:5000/synthesize"},
 
         {"key": "text", "label": "Text to speak", "type": "multiline",
          "default": "{{ $json.response }}",
@@ -99,16 +123,17 @@ class TextToSpeechNode(Node):
          "example": "{{ $json.response }}"},
 
         {"key": "body_mode", "label": "Request shape", "type": "select",
-         "default": "raw text", "options": ["raw text", "openai json", "form"],
-         "desc": "raw text = Piper's own http_server (body is the words). "
-                 "openai json = Speaches / openedai-speech / LocalAI. "
+         "default": "piper json",
+         "options": ["piper json", "openai json", "raw text", "form"],
+         "desc": "piper json = Piper's own http_server, {\"text\": ...} to "
+                 "/synthesize. openai json = Speaches / openedai-speech / "
+                 "LocalAI / Kokoro. raw text = the body is just the words. "
                  "form = text=... as a form post."},
 
         {"key": "voice", "label": "Voice", "type": "text", "default": "",
-         "desc": "Which voice to use, for servers that take one. Piper's own "
-                 "http_server is started with its voice already chosen, so "
-                 "leave this blank for 'raw text'.",
-         "example": "en_US-amy-medium"},
+         "desc": "Which voice to use. Piper's http_server is started with "
+                 "one already loaded, so blank means 'the one it has'.",
+         "example": "en_US-lessac-medium"},
 
         {"key": "model", "label": "Model", "type": "text", "default": "",
          "desc": "Model name, for servers that want one. Blank is fine for "
@@ -118,13 +143,14 @@ class TextToSpeechNode(Node):
         {"key": "audio_format", "label": "Audio format", "type": "select",
          "default": "wav", "options": ["wav", "mp3", "opus", "ogg", "flac"],
          "desc": "What to ask the server for, and the extension the file "
-                 "gets. Piper only does wav on its own -- the wrappers do "
-                 "the rest."},
+                 "gets. Piper only returns wav -- the OpenAI-compatible "
+                 "wrappers do the rest."},
 
         {"key": "extra_fields", "label": "Extra fields", "type": "kv_dict",
          "default": {}, "name_hint": "field", "value_hint": "value",
-         "desc": "Anything else your server takes, like speed or "
-                 "length_scale. Added to the JSON or the form."},
+         "desc": "Anything else your server takes. Piper: length_scale "
+                 "(speed, 1 is normal), speaker, speaker_id, noise_scale, "
+                 "noise_w_scale. Added to the JSON or the form."},
 
         {"key": "auth", "label": "Authorization header", "type": "text",
          "default": "",
@@ -175,7 +201,16 @@ class TextToSpeechNode(Node):
         if auth:
             headers["Authorization"] = auth
 
-        if mode == "openai json":
+        if mode == "piper json":
+            body = {"text": text}
+            if fields.get("voice"):
+                body["voice"] = fields["voice"]
+            for key, val in fields.get("extra", {}).items():
+                body[key] = _number_if_possible(val)
+            data = _json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        elif mode == "openai json":
             body = {"input": text}
             if fields.get("model"):
                 body["model"] = fields["model"]
@@ -216,7 +251,7 @@ class TextToSpeechNode(Node):
         if not endpoint_raw:
             raise ValueError("Text to Speech needs an endpoint")
 
-        mode = self.p("body_mode", "raw text")
+        mode = self.p("body_mode", "piper json")
         fmt = str(self.p("audio_format", "wav")).lower()
         out_field = str(self.p("output_field", "audio_path")).strip() or "audio_path"
         on_error = self.p("on_error", "error")
