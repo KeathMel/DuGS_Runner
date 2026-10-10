@@ -66,6 +66,35 @@ def _downstream_of(start: str, connections: dict) -> set[str]:
     return seen
 
 
+def _nodes_on_cycles(connections: dict) -> set[str]:
+    """Every node that can reach itself by following wires.
+
+    A workflow with a feedback loop -- an IF whose "not good enough yet"
+    branch runs back into the AI node that produced the answer -- has a
+    cycle in it, and the nodes ON that cycle are exactly the ones meant to
+    run more than once. Reading that off the graph means a loop needs no
+    special node type and no checkbox: wire it, and it loops.
+
+    Only nodes genuinely on a cycle are returned, so a workflow without one
+    behaves exactly as it always has.
+    """
+    adj = {src: [l["to"] for l in links] for src, links in connections.items()}
+    on_cycle: set[str] = set()
+    for start in adj:
+        seen: set[str] = set()
+        stack = list(adj.get(start, ()))
+        while stack:
+            cur = stack.pop()
+            if cur == start:
+                on_cycle.add(start)
+                break
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(adj.get(cur, ()))
+    return on_cycle
+
+
 class Engine:
     def __init__(self, nodes_dir: str):
         self.nodes_dir = nodes_dir
@@ -163,6 +192,36 @@ class Engine:
         # nodes let through by the end-of-run safety valve (see _release_next)
         released: set[str] = set()
 
+        # ---- feedback loops without a Loop node ----------------------------
+        # Any node sitting on a cycle is allowed to fire again, the same way a
+        # Loop node is. That is what lets an AI node be re-asked: wire its
+        # output back round to it (through an IF, usually) and the second
+        # arrival actually runs instead of being swallowed as "already done".
+        # Nothing is lost between passes -- `results` is never cleared, so
+        # {{ $('Some Node').item.json.x }} still sees the earlier run's data.
+        cyclic = _nodes_on_cycles(connections) & set(instances)
+        if cyclic:
+            print(f"loops detected around: {sorted(cyclic)}")
+        # a backstop, not the real brake: a loop normally ends because its IF
+        # stops sending items round. This stops a mis-wired graph (or a model
+        # that never satisfies the condition) burning calls forever.
+        try:
+            max_passes = max(1, int(workflow.get("max_loops", 25) or 25))
+        except (TypeError, ValueError):
+            max_passes = 25
+        passes: dict[str, int] = {}
+        # nodes whose last "run" was really a dead-branch collapse: they were
+        # marked done without doing anything. If real items turn up for one
+        # later -- which is exactly what happens on the pass a loop finally
+        # exits on -- it must be allowed to do the work after all, instead of
+        # the delivery being dropped as "already run".
+        skipped_empty: set[str] = set()
+        # how many times each node has actually executed this run. Rides along
+        # on every event as "pass", so a UI can keep each activation separately
+        # instead of the last one quietly overwriting the ones before it --
+        # which is the whole point of a loop: what changed between passes.
+        exec_count: dict[str, int] = {}
+
         if start_node:
             seed: list[tuple[str, int, list]] = [
                 (start_node, 0, [{"json": start_data or {}}])
@@ -251,10 +310,24 @@ class Engine:
             # makes a feedback loop possible: an IF's "false" branch can wire
             # back into a Loop node and re-trigger it. Every other node keeps
             # the original run-exactly-once behaviour.
-            can_rerun = getattr(node_cls, "ALLOW_RERUN", False)
+            can_rerun = getattr(node_cls, "ALLOW_RERUN", False) or name in cyclic
             if name in ran and not can_rerun:
-                continue
+                if name in skipped_empty and incoming:
+                    # it never actually ran -- it was collapsed as an untaken
+                    # branch. Real data has arrived now, so let it through.
+                    ran.discard(name); skipped_empty.discard(name)
+                    buffers.pop(name, None); arrived.pop(name, None)
+                    delivered.pop(name, None); released.discard(name)
+                else:
+                    continue
             if name in ran and can_rerun:
+                passes[name] = passes.get(name, 1) + 1
+                if passes[name] > max_passes:
+                    print(f"    (!) '{name}' hit the {max_passes}-pass loop "
+                          f"limit -- not going round again")
+                    emit({"kind": "node_error", "node": name,
+                          "error": f"loop limit reached ({max_passes} passes)"})
+                    continue
                 # starting a fresh pass through the loop: clear this node's
                 # previous arrivals/buffers so port gating works again.
                 ran.discard(name)
@@ -290,6 +363,8 @@ class Engine:
                     continue
 
             ran.add(name)
+            exec_count[name] = exec_count.get(name, 0) + 1
+            this_pass = exec_count[name]
             node = instances[name]
 
             # assemble inputs as an ordered list of per-port item lists
@@ -330,11 +405,14 @@ class Engine:
                 run_arg = input_ports
 
             if skip_empty:
+                skipped_empty.add(name)
                 print(f"--> {node.TYPE} '{name}'  SKIPPED (branch not taken)")
             else:
+                skipped_empty.discard(name)
                 print(f"--> {node.TYPE} '{name}'  ({total_in} items in across {len(need)} port(s))")
                 emit({"kind": "node_running", "node": name,
-                      "type": node.TYPE, "items_in": total_in})
+                      "type": node.TYPE, "items_in": total_in,
+                      "pass": this_pass})
 
             # build the cross-node context: {node_name: [items...]} from every
             # node that has produced output so far, so expressions like
@@ -369,7 +447,8 @@ class Engine:
                     pending_webhook_response = {"status": e.status, "body": e.body}
                     ms = (time.perf_counter() - t0) * 1000
                     emit({"kind": "node_done", "node": name, "items_out": 1,
-                          "ports": [1], "ms": ms, "sample": [e.body]})
+                          "ports": [1], "ms": ms, "sample": [e.body],
+                          "pass": this_pass})
                     # give it real output so anything wired to Respond's own
                     # output port receives the same data a normal (non-signal)
                     # completion would have produced
@@ -395,7 +474,8 @@ class Engine:
             sample = [it.get("json", {}) for it in first_port[:3]]
             if not errored and not skip_empty:
                 emit({"kind": "node_done", "node": name, "items_out": total_out,
-                      "ports": port_counts, "ms": ms, "sample": sample})
+                      "ports": port_counts, "ms": ms, "sample": sample,
+                      "pass": this_pass})
 
             # push to connected nodes, honouring the destination input port
             for link in connections.get(name, []):
@@ -410,7 +490,8 @@ class Engine:
                 tgt_cls = instances[target].__class__ if target in instances else None
                 if (not items_for_target
                         and tgt_cls is not None
-                        and getattr(tgt_cls, "ALLOW_RERUN", False)
+                        and (getattr(tgt_cls, "ALLOW_RERUN", False)
+                             or target in cyclic)
                         and target in ran):
                     print(f"    -> '{target}' skipped (0 items, loop not re-triggered)")
                     continue
