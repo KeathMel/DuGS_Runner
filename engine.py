@@ -426,6 +426,13 @@ class Engine:
                     context[done_name] = done_ports
             node._context = context
 
+            # what came IN, so a viewer can subtract it from what goes out
+            # and show only this node's own contribution
+            in_sample = []
+            for _it in (input_ports[0] if input_ports else [])[:3]:
+                _j = _it.get("json") if isinstance(_it, dict) else None
+                in_sample.append(_j if isinstance(_j, dict) else {})
+
             t0 = time.perf_counter()
             errored = False
             try:
@@ -448,7 +455,7 @@ class Engine:
                     ms = (time.perf_counter() - t0) * 1000
                     emit({"kind": "node_done", "node": name, "items_out": 1,
                           "ports": [1], "ms": ms, "sample": [e.body],
-                          "pass": this_pass})
+                          "in_sample": in_sample, "pass": this_pass})
                     # give it real output so anything wired to Respond's own
                     # output port receives the same data a normal (non-signal)
                     # completion would have produced
@@ -475,7 +482,7 @@ class Engine:
             if not errored and not skip_empty:
                 emit({"kind": "node_done", "node": name, "items_out": total_out,
                       "ports": port_counts, "ms": ms, "sample": sample,
-                      "pass": this_pass})
+                      "in_sample": in_sample, "pass": this_pass})
 
             # push to connected nodes, honouring the destination input port
             for link in connections.get(name, []):
