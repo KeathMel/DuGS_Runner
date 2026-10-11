@@ -123,6 +123,55 @@ def triggers_of(wf):
 # same pattern as a deployed project landing in projects/. The app's home
 # screen module just reads this folder; nothing more to wire up.
 RUNS_DIR = os.path.join(DATA_DIR, "runs")
+# anything posted that is NOT text lands here as a real file, so a node can
+# open it. Decoding a voice note as UTF-8 and hoping is not a plan.
+UPLOADS_DIR = os.path.join(DATA_DIR, "uploads")
+# how long a received upload is kept before being swept away
+UPLOAD_KEEP_HOURS = 24
+
+_BINARY_EXT = {
+    "audio/webm": ".webm", "audio/ogg": ".ogg", "audio/opus": ".opus",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac",
+    "audio/flac": ".flac", "audio/amr": ".amr", "video/webm": ".webm",
+    "image/png": ".png", "image/jpeg": ".jpg", "application/pdf": ".pdf",
+}
+
+
+def _looks_textual(ctype):
+    c = (ctype or "").lower()
+    if not c:
+        return True
+    return any(h in c for h in ("json", "text/", "xml", "x-www-form-urlencoded",
+                                "javascript", "yaml", "csv"))
+
+
+def _sweep_uploads():
+    """Received files are working data, not archives. Drop the old ones."""
+    cutoff = time.time() - UPLOAD_KEEP_HOURS * 3600
+    try:
+        for f in os.listdir(UPLOADS_DIR):
+            p = os.path.join(UPLOADS_DIR, f)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _save_upload(blob, ctype):
+    """Write a posted non-text body to disk and describe where it went."""
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    _sweep_uploads()
+    base = (ctype or "").split(";")[0].strip().lower()
+    ext = _BINARY_EXT.get(base, ".bin")
+    name = "upload_%d%s" % (int(time.time() * 1000), ext)
+    path = os.path.join(UPLOADS_DIR, name)
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    return path, name
 
 
 def _extract_layout(wf):
@@ -290,12 +339,53 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _body(self):
+        """What was posted, in a shape a node can actually use.
+
+        JSON still arrives as a dict, exactly as before. The change is
+        everything else: a voice note posted as audio/webm used to be
+        decoded as UTF-8 with errors="replace", which turns every byte that
+        is not valid UTF-8 into U+FFFD -- the audio was destroyed before any
+        node saw it, and there was nothing to point a Speech to Text node at.
+
+        Now a non-text body is written to uploads/ and the item carries the
+        PATH to it:
+
+            {"audio_path": "/data/uploads/upload_1760000000000.webm",
+             "content_type": "audio/webm", "bytes": 48213,
+             "filename": "upload_...webm", "is_binary": true}
+
+        so Speech to Text reads it with source "file path" and
+        {{ $json.body.audio_path }}.
+        """
         try:
             n = int(self.headers.get("Content-Length", 0) or 0)
             raw = self.rfile.read(n) if n else b""
-            return json.loads(raw) if raw else {}
         except Exception:
             return {}
+        if not raw:
+            return {}
+
+        ctype = self.headers.get("Content-Type", "") or ""
+
+        # JSON first -- by far the common case, and unchanged
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+
+        if _looks_textual(ctype):
+            # genuinely text that merely isn't JSON: hand it over as before
+            return raw.decode("utf-8", errors="replace")
+
+        try:
+            path, name = _save_upload(raw, ctype)
+        except Exception as e:
+            log(f"could not save upload: {e}")
+            return {"error": f"could not save the posted file: {e}",
+                    "content_type": ctype, "bytes": len(raw)}
+        log(f"saved upload: {name} ({len(raw)} bytes, {ctype or 'no type'})")
+        return {"audio_path": path, "file_path": path, "filename": name,
+                "content_type": ctype, "bytes": len(raw), "is_binary": True}
 
     def _match(self, method, path):
         """Find a webhook registered for this request, honouring ANY."""
@@ -407,6 +497,19 @@ class Handler(BaseHTTPRequestHandler):
         # a Respond to Webhook node decides the reply when there is one
         resp = result.get("__webhook_response__") if isinstance(result, dict) else None
         if resp:
+            # a Respond node set to 'file' hands over a PATH, not bytes, so
+            # the audio never travels through the engine or the run log
+            rbody = resp.get("body")
+            if isinstance(rbody, dict) and rbody.get("__file__"):
+                path = rbody["__file__"]
+                ctype = rbody.get("__content_type__") or "application/octet-stream"
+                try:
+                    with open(path, "rb") as fh:
+                        blob = fh.read()
+                except Exception as e:
+                    return self._send(500, {"error": f"could not read {path}: {e}"})
+                log(f"reply: {os.path.basename(path)} ({len(blob)} bytes, {ctype})")
+                return self._send(resp.get("status", 200), blob, ctype=ctype)
             return self._send(resp.get("status", 200), resp.get("body", {}))
         self._send(200, {"ok": True})
 
