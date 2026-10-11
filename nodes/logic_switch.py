@@ -126,7 +126,7 @@ class SwitchNode(Node):
                 pass
         return actual, cmp_val
 
-    def _test(self, actual, op, cmp_val, j, field_name):
+    def _test(self, actual, op, cmp_val, j, field_name, missing=False):
         if op == "equals":           return actual == cmp_val
         if op == "not equals":       return actual != cmp_val
         if op == "greater than":     return actual is not None and actual > cmp_val
@@ -135,8 +135,14 @@ class SwitchNode(Node):
         if op == "less or equal":    return actual is not None and actual <= cmp_val
         if op == "contains":         return cmp_val in str(actual or "")
         if op == "not contains":     return cmp_val not in str(actual or "")
-        if op == "exists":           return field_name in j
-        if op == "not exists":       return field_name not in j
+        # 'exists' used to ask `field_name in j` -- but field_name is the
+        # raw text you typed, so for an expression it was asking whether the
+        # literal string "{{ $('X').item.json.y }}" was a key on the item.
+        # It never is, so exists was ALWAYS false and not-exists ALWAYS true
+        # for any expression. `missing` is already worked out properly above
+        # for both the expression and the plain-field-name cases.
+        if op == "exists":           return not missing
+        if op == "not exists":       return missing
         if op == "is empty":         return actual in (None, "", [], {})
         if op == "is not empty":     return actual not in (None, "", [], {})
         if op == "regex match":
@@ -175,7 +181,7 @@ class SwitchNode(Node):
                     f"Switch node: the field {shown} is missing on this item, "
                     f"and this node is set to error when that happens.")
             return mode == "true"
-        return self._test(actual, op, cmp_val, j, field_name)
+        return self._test(actual, op, cmp_val, j, field_name, missing)
 
     # --- main -----------------------------------------------------------
     def run(self, items):
