@@ -6,10 +6,15 @@ import os
 import json
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PROJECTS_DIR = os.path.join(HERE, "projects")
-TABELS_DIR = os.path.join(HERE, "tabels")
-CREDENTIALS_DIR = os.path.join(HERE, "credentials")
-MEMORY_DIR = os.path.join(HERE, "memory_banks")
+# Everything lives under DUGS_DATA_DIR, the same folder dugs_runner.py uses
+# for projects/ and runs/. These used to sit next to the source instead, so a
+# deployed tabel or credential landed in one place and was looked for in
+# another -- which is why credentials had to be mounted by hand.
+DATA_DIR = os.environ.get("DUGS_DATA_DIR", HERE)
+PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
+TABELS_DIR = os.path.join(DATA_DIR, "tabels")
+CREDENTIALS_DIR = os.path.join(DATA_DIR, "credentials")
+MEMORY_DIR = os.path.join(DATA_DIR, "memory_banks")
 DOWNLOADS = os.path.expanduser("~/Downloads")
 
 
@@ -81,7 +86,7 @@ def save_tabel(n, d):
 
 # ---- credentials: named secrets (e.g. a DeepSeek token) reusable by nodes ----
 def list_credentials(): return _list(CREDENTIALS_DIR)
-def load_credential(n): return _load(CREDENTIALS_DIR, n)
+def load_credential(n): return decrypt_credential(_load(CREDENTIALS_DIR, n))
 def save_credential(n, d): _save(CREDENTIALS_DIR, n, d)
 
 
@@ -290,6 +295,17 @@ def is_deployed(name):
 # are derived by scanning the workflow itself, on demand, every time. If two
 # workflows need the same tabel, "is it still needed" is answered the same
 # way: scan whoever else is still deployed.
+def _node_credentials(nodes):
+    """Credential names the nodes reference, so Deploy can send the keys the
+    workflow actually needs -- and only those."""
+    out = set()
+    for n in nodes or []:
+        cred = (n.get("params") or {}).get("credential")
+        if cred and isinstance(cred, str) and not cred.startswith("sk-"):
+            out.add(cred)
+    return out
+
+
 def _node_dependencies(nodes):
     """(tabel names, memory bank names) referenced by a list of node specs."""
     tabels, banks = set(), set()
@@ -357,9 +373,12 @@ def _guard_not_local_projects(p):
 
 def deploy_project(name):
     """Copy a saved project into the runner's folder, along with whatever
-    Tabels or Memory Banks its nodes actually use -- those land in tabels/
-    and memory_banks/ next to projects/, so the runner's copy of storage.py
-    (same file, same relative layout) finds them without any code change."""
+    Tabels, Memory Banks or credentials its nodes actually use.
+
+    Anything that cannot be sent is collected and raised at the end. It
+    used to be swallowed by a bare `except: pass`, which meant a missing
+    Tabel looked exactly like a successful deploy -- right up until the
+    runner errored with "Tabel does not exist"."""
     p = deploy_path()
     if not p:
         raise RuntimeError("no deploy folder set")
@@ -372,16 +391,45 @@ def deploy_project(name):
         json.dump(data, f, indent=2)
 
     base = _deploy_base()
+    problems = []
+
+    # credentials this workflow needs, scrambled on the way out -- without
+    # these the runner has no API key and every AI node quietly returns
+    # nothing, which looks exactly like a broken workflow
+    creds = _node_credentials(data.get("nodes", []))
+    if creds:
+        cdir = os.path.join(base, "credentials")
+        os.makedirs(cdir, exist_ok=True)
+        for c in creds:
+            try:
+                with open(os.path.join(cdir, f"{c}.json"), "w") as f:
+                    json.dump(encrypt_credential(load_credential(c)), f, indent=2)
+            except Exception as e:
+                problems.append(f"credential '{c}': {e}")
+
     tabels, banks = _node_dependencies(data.get("nodes", []))
+
     if tabels:
         tdir = os.path.join(base, "tabels")
         os.makedirs(tdir, exist_ok=True)
         for t in tabels:
             try:
+                # read it the same way the Tabel editor writes it. storage
+                # and tabel_store resolve their folder independently, so
+                # going through storage alone can read an empty folder and
+                # send nothing while reporting success.
+                try:
+                    import tabel_store as _ts
+                    payload = _ts.load_tabel(t)
+                except Exception:
+                    payload = load_tabel(t)
                 with open(os.path.join(tdir, f"{t}.json"), "w") as f:
-                    json.dump(load_tabel(t), f, indent=2)
-            except Exception:
-                pass   # tabel doesn't exist locally -- nothing to send
+                    json.dump(payload, f, indent=2)
+            except Exception as e:
+                problems.append(
+                    f"Tabel '{t}' could not be sent ({e}) -- the runner will "
+                    f"error with \"Tabel '{t}' does not exist\"")
+
     if banks:
         bdir = os.path.join(base, "memory_banks")
         os.makedirs(bdir, exist_ok=True)
@@ -389,10 +437,15 @@ def deploy_project(name):
             try:
                 with open(os.path.join(bdir, f"{b}.json"), "w") as f:
                     json.dump(load_memory_bank(b), f, indent=2)
-            except Exception:
-                pass
+            except Exception as e:
+                problems.append(f"Memory Bank '{b}': {e}")
 
     mark_deployed(name, True)
+
+    if problems:
+        raise RuntimeError(
+            "The workflow was deployed, but parts of it did not go with it:"
+            "\n  - " + "\n  - ".join(problems))
     return dest
 
 
@@ -407,6 +460,12 @@ def undeploy_project(name):
         mark_deployed(name, False)
         return
     _guard_not_local_projects(p)
+
+    # Bring the runner's work home first. While deployed, the workflow has
+    # been writing to ITS copy of the memory banks and tabels -- undeploying
+    # without this would throw all of that away and leave you looking at
+    # whatever the app last had, which is usually weeks stale.
+    sync_from_runner(name)
 
     my_tabels, my_banks = set(), set()
     dest = os.path.join(p, f"{name}.json")
@@ -444,6 +503,50 @@ def undeploy_project(name):
         fp = os.path.join(base, "memory_banks", f"{b}.json")
         if os.path.isfile(fp):
             os.remove(fp)
+
+
+def sync_from_runner(name=None):
+    """Copy memory banks and tabels back from the runner into the app.
+
+    The runner is the one actually running the workflow, so its copies are
+    the live ones. Pass a project name to sync only what that project uses,
+    or nothing to sync everything the runner has.
+    """
+    base = _deploy_base()
+    if not base or not os.path.isdir(base):
+        return 0
+
+    wanted_tabels = wanted_banks = None
+    if name:
+        try:
+            with open(os.path.join(deploy_path(), f"{name}.json")) as f:
+                wanted_tabels, wanted_banks = _node_dependencies(
+                    json.load(f).get("nodes", []))
+        except Exception:
+            return 0
+
+    pulled = 0
+    for folder, wanted, target in (
+            ("memory_banks", wanted_banks, MEMORY_DIR),
+            ("tabels", wanted_tabels, TABELS_DIR)):
+        src = os.path.join(base, folder)
+        if not os.path.isdir(src):
+            continue
+        _ensure(target)
+        for fn in os.listdir(src):
+            if not fn.endswith(".json"):
+                continue
+            if wanted is not None and fn[:-5] not in wanted:
+                continue
+            try:
+                with open(os.path.join(src, fn)) as f:
+                    data = json.load(f)
+                with open(os.path.join(target, fn), "w") as f:
+                    json.dump(data, f, indent=2)
+                pulled += 1
+            except Exception:
+                continue
+    return pulled
 
 
 def sync_deployed_from_disk():
@@ -655,3 +758,58 @@ def semantic_variation_count(table_name):
     well matching will work."""
     d = load_semantic_table(table_name)
     return sum(len(i.get("variations") or []) for i in d.get("intents", []))
+
+
+# ---- credential obfuscation ------------------------------------------------
+# API keys have to travel to the runner somehow, and a plain-text key sitting
+# in a synced folder is asking for trouble. This scrambles them with an
+# HMAC-SHA256 keystream (stdlib only -- the runner has no pip packages).
+#
+# BE CLEAR ABOUT WHAT THIS IS: with the built-in default key this is
+# obfuscation, not security. Anyone with the source can unscramble it. Set
+# DUGS_SECRET to the same value on both machines and it becomes real
+# protection, because the key is then no longer in the code.
+SECRET = os.environ.get("DUGS_SECRET", "dugs-default-obfuscation-key")
+
+
+def _keystream(key, salt, n):
+    import hmac, hashlib
+    out, counter = b"", 0
+    while len(out) < n:
+        out += hmac.new(key.encode(), salt + str(counter).encode(),
+                        hashlib.sha256).digest()
+        counter += 1
+    return out[:n]
+
+
+def encrypt_text(plain, key=None):
+    import base64
+    key = key or SECRET
+    salt = os.urandom(8)
+    raw = str(plain).encode("utf-8")
+    body = bytes(a ^ b for a, b in zip(raw, _keystream(key, salt, len(raw))))
+    return base64.b64encode(salt + body).decode("ascii")
+
+
+def decrypt_text(blob, key=None):
+    import base64
+    key = key or SECRET
+    data = base64.b64decode(str(blob).encode("ascii"))
+    salt, body = data[:8], data[8:]
+    return bytes(a ^ b for a, b in zip(body, _keystream(key, salt, len(body)))).decode("utf-8")
+
+
+def encrypt_credential(data):
+    """Wrap a credential dict so its secrets aren't readable at a glance."""
+    return {"__enc__": encrypt_text(json.dumps(data))}
+
+
+def decrypt_credential(data):
+    """Unwrap if it was wrapped; pass plain ones straight through, so old
+    unencrypted credential files keep working."""
+    if isinstance(data, dict) and "__enc__" in data:
+        try:
+            return json.loads(decrypt_text(data["__enc__"]))
+        except Exception:
+            return {}
+    return data
